@@ -92,6 +92,10 @@ class LocalBashEnv:
         if self.contain and command_targets_host(command):
             return ExecResult(output=_BLOCKED_MESSAGE, returncode=1)
         try:
+            kwargs = {}
+            if os.name == "posix":
+                kwargs["start_new_session"] = True
+                
             process = subprocess.Popen(
                 ["bash", "-c", command],
                 cwd=self.workspace,
@@ -100,16 +104,19 @@ class LocalBashEnv:
                 text=True,
                 errors="replace",  # binary output becomes a real observation, not a crash
                 env=_scrubbed_env(),  # never expose the capture process's provider credentials
-                start_new_session=True,
+                **kwargs
             )
             stdout, stderr = process.communicate(timeout=self.timeout_s)
             returncode = process.returncode
         except subprocess.TimeoutExpired:
             if os.name == "posix":
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                os.killpg(process.pid, signal.SIGKILL)
             else:
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True)
-            process.communicate()
+            try:
+                process.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
             return ExecResult(
                 output=f"command timed out after {self.timeout_s}s",
                 returncode=_TIMEOUT_RETURNCODE,
