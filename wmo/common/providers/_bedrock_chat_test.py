@@ -213,10 +213,48 @@ def test_converse_retains_tools_for_none_choice_with_tool_history() -> None:
     tool_config = wire["toolConfig"]
     assert isinstance(tool_config, dict)
     tool_config_data = cast("dict[str, object]", tool_config)
-    assert "toolChoice" not in tool_config_data
+    # Locked to auto so the model can interpret history but cannot call new tools.
+    assert tool_config_data["toolChoice"] == {"auto": {}}
     assert cast("list[dict[str, object]]", tool_config_data["tools"])[0]["toolSpec"] == {
         "name": "bash",
         "description": "run a command",
         "inputSchema": {"json": {"type": "object"}},
     }
+
+
+def test_converse_retains_toolconfig_for_toolless_replay_with_history() -> None:
+    """Replayed tool history without current tools still needs a toolConfig placeholder.
+
+    Bedrock rejects requests whose message history contains toolUse or toolResult
+    blocks if toolConfig is absent, even when no tools are passed for this turn.
+    """
+    request = ChatRequest.model_validate(
+        {
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "a.txt"},
+                {"role": "user", "content": "now summarise"},
+            ],
+            # No tools on this turn.
+        }
+    )
+
+    wire = converse_request(request, "model-id")
+
+    tool_config = wire["toolConfig"]
+    assert isinstance(tool_config, dict)
+    tool_config_data = cast("dict[str, object]", tool_config)
+    assert tool_config_data["tools"] == []
+    assert tool_config_data["toolChoice"] == {"auto": {}}
 

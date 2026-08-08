@@ -76,6 +76,7 @@ def converse_request(request: ChatRequest, model: str) -> dict[str, object]:
     }
     if system:
         result["system"] = system
+    choice = request.tool_choice
     if request.tools:
         tools = [
             {
@@ -88,18 +89,25 @@ def converse_request(request: ChatRequest, model: str) -> dict[str, object]:
             for tool in request.tools
         ]
         tool_config: dict[str, object] = {"tools": tools}
-        choice = request.tool_choice
         if choice == "required":
             tool_config["toolChoice"] = {"any": {}}
+        elif choice == "none" and has_tool_history:
+            # Caller disabled tools for this turn but history has toolUse/toolResult
+            # blocks. Bedrock requires toolConfig to be present; lock it to auto so
+            # the model can interpret the history without being allowed to call new
+            # tools (auto is the least-permissive mode Converse supports here).
+            tool_config["toolChoice"] = {"auto": {}}
         elif isinstance(choice, dict):
             function = choice.get("function")
             if isinstance(function, dict) and isinstance(function.get("name"), str):
                 tool_config["toolChoice"] = {"tool": {"name": function["name"]}}
         if choice != "none" or has_tool_history:
-            # Converse requires toolConfig whenever replayed history contains
-            # toolUse/toolResult blocks. Bedrock has no exact "none" choice, so
-            # retain the available tools in auto mode for those follow-up turns.
             result["toolConfig"] = tool_config
+    elif has_tool_history:
+        # No tools on this turn but replayed history carries toolUse/toolResult
+        # blocks. Bedrock rejects the request without toolConfig, so attach an
+        # empty tools list in auto mode as the minimum-viable placeholder.
+        result["toolConfig"] = {"tools": [], "toolChoice": {"auto": {}}}
     return result
 
 
