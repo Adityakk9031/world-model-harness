@@ -359,11 +359,20 @@ def reconcile_completion_economics(
             + written * reservation.cache_write_usd_per_million_tokens
         )
     elif cached is None:
-        successful_input_cost = usage.input_tokens * CompletionCostReservation._input_price_ceiling(
-            reservation.input_usd_per_million_tokens,
-            reservation.cached_input_usd_per_million_tokens,
-            reservation.cache_write_usd_per_million_tokens,
-        )
+        if written is not None:
+            successful_input_cost = (
+                (usage.input_tokens - written) * reservation.input_usd_per_million_tokens
+                + written * reservation.cache_write_usd_per_million_tokens
+            )
+        else:
+            successful_input_cost = (
+                usage.input_tokens
+                * CompletionCostReservation._input_price_ceiling(
+                    reservation.input_usd_per_million_tokens,
+                    reservation.cached_input_usd_per_million_tokens,
+                    reservation.cache_write_usd_per_million_tokens,
+                )
+            )
     else:
         uncached_price = max(
             reservation.input_usd_per_million_tokens,
