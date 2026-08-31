@@ -430,8 +430,8 @@ class NativeControlPlane(NativeObservabilityMixin):
             self._accounting.finish_request_quietly(
                 authorization,
                 GatewayFailure(
-                    failure_class=GatewayFailureClass.INTERNAL,
-                    safe_message="retained provider continuation authority was unavailable",
+                    failure_class=GatewayFailureClass.INVALID_REQUEST,
+                    safe_message=exc.message,
                 ),
             )
             raise NativeBridgeError(exc) from exc
