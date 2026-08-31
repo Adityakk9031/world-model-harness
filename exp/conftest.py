@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import os
-import pty
 import re
 import select
 import struct
 import subprocess
 import sys
-import termios
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+if sys.platform != "win32":
+    import fcntl
+    import pty
+    import termios
+else:
+    fcntl: Any = None
+    pty: Any = None
+    termios: Any = None
 
 import pytest
 
@@ -213,6 +220,8 @@ def _run_terminal_child(
     Returns:
         The transcript, the still-visible screen, and the child exit status.
     """
+    if pty is None or fcntl is None or termios is None:
+        pytest.skip("pseudo-terminal execution requires a POSIX environment")
     master, slave = pty.openpty()
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", size[0], size[1], 0, 0))
     child_environment = dict(os.environ if environment is None else environment)
