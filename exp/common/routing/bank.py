@@ -346,13 +346,24 @@ def load_knn_bank(
 
 
 def _novelty_floor(embeddings: np.ndarray) -> float:
-    """Return the fifth percentile of each fit row's nearest distinct neighbor."""
+    """Return the fifth percentile of each fit row's nearest distinct neighbor.
+
+    Args:
+        embeddings: Unit-normalized embedding array of shape (N, D).
+
+    Returns:
+        The empirical cosine threshold for novelty gating.
+    """
     if embeddings.shape[0] < 2:
         return 1.0
     similarities = embeddings @ embeddings.T
     np.fill_diagonal(similarities, -np.inf)
-    nearest = np.max(similarities, axis=1).astype(np.float64)
-    return float(np.quantile(nearest, 0.05))
+    distinct_similarities = np.where(similarities >= 1.0 - 1e-5, -np.inf, similarities)
+    nearest = np.max(distinct_similarities, axis=1).astype(np.float64)
+    finite_nearest = nearest[np.isfinite(nearest)]
+    if len(finite_nearest) == 0:
+        return 0.0
+    return float(np.quantile(finite_nearest, 0.05))
 
 
 def evidence_counts(bank: KnnEvidenceBank) -> tuple[CandidateEvidenceCount, ...]:

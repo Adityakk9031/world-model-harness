@@ -311,3 +311,17 @@ def _world_protocol() -> EvaluationProtocol:
         judge_calibration_id="calibration-a",
         pricing_snapshot_id="pricing-a",
     )
+
+
+def test_novelty_floor_ignores_duplicate_embeddings() -> None:
+    """Duplicate tasks in the fit dataset do not collapse novelty floor to 1.0."""
+    from exp.common.routing.bank import _novelty_floor
+
+    # 10 identical vectors of (1.0, 0.0) and 10 identical vectors of (0.0, 1.0)
+    cluster_a = np.repeat([[1.0, 0.0]], 10, axis=0)
+    cluster_b = np.repeat([[0.0, 1.0]], 10, axis=0)
+    embeddings = np.vstack([cluster_a, cluster_b]).astype(np.float32)
+
+    # With duplicates ignored, nearest distinct neighbor similarity is 0.0, not 1.0
+    floor = _novelty_floor(embeddings)
+    assert floor == pytest.approx(0.0)
