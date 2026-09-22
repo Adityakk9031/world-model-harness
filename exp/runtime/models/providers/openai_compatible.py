@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
-from typing import ClassVar, cast
+from dataclasses import replace
+from typing import ClassVar, Literal, cast
 
 from pydantic import JsonValue
 
@@ -18,9 +19,12 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    RawEmbedding,
+    RawEmbeddingBatch,
     ToolCall,
     Usage,
 )
+from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
 )
@@ -30,6 +34,10 @@ from exp.runtime.models.providers.base import (
     GatewayWireProfile,
     ProviderHttpClient,
     ReasoningWireFormat,
+)
+from exp.runtime.models.providers.deepseek import (
+    is_deepseek_base_url,
+    is_deepseek_model_id,
 )
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
@@ -43,6 +51,11 @@ from exp.runtime.models.providers.errors import (
 from exp.runtime.models.providers.fireworks import (
     is_fireworks_base_url,
     reasoning_content_route_sha256,
+)
+from exp.runtime.models.providers.hunyuan import is_hunyuan_base_url
+from exp.runtime.models.providers.instruction_turns import (
+    fold_instruction_turns_after_the_first,
+    fold_trailing_instruction_turns,
 )
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
@@ -72,6 +85,8 @@ def openai_compatible_request(
     reasoning_effort: str | None = None,
     reasoning_wire_format: ReasoningWireFormat = "reasoning_effort",
     sampling_requires_reasoning_none: bool = False,
+    deepseek_reasoning_history: bool = False,
+    system_messages_leading_only: bool = False,
 ) -> JsonObject:
     """Convert a EXP request into one non-streaming Chat Completions payload.
 
@@ -91,6 +106,15 @@ def openai_compatible_request(
         supports_reasoning: Whether this exact model accepts a reasoning control.
         reasoning_effort: Optional catalog-pinned reasoning effort.
         reasoning_wire_format: Provider field used for normalized reasoning effort.
+        deepseek_reasoning_history: Whether this is DeepSeek's own origin, whose
+            thinking mode requires ``reasoning_content`` on every assistant message
+            of the current turn; every assistant message is backfilled with an
+            empty one (the typed request carries no reasoning to forward), the
+            same rule the streaming builder applies in ``openai_chat_message``.
+        system_messages_leading_only: Whether this rung's chat template accepts a
+            system message only as the very first message; every other
+            instruction turn is folded into user text, the same rule as the
+            streaming builder (``fold_instruction_turns_after_the_first``).
 
     Returns:
         A JSON object for ``/chat/completions``.
@@ -98,9 +122,18 @@ def openai_compatible_request(
     Raises:
         ValueError: A request message cannot be represented without losing tool context.
     """
+    messages: Sequence[ModelMessage] = request.messages
+    if deepseek_reasoning_history or is_deepseek_model_id(model_id):
+        # Same DeepSeek trailing-instruction rule as the streaming builder.
+        messages = fold_trailing_instruction_turns(messages)
+    if system_messages_leading_only:
+        messages = fold_instruction_turns_after_the_first(messages)
     payload: JsonObject = {
         "model": model_id,
-        "messages": [_openai_message(message) for message in request.messages],
+        "messages": [
+            _openai_message(message, deepseek_reasoning_history=deepseek_reasoning_history)
+            for message in messages
+        ],
         "stream": False,
     }
     if request.tools:
@@ -154,9 +187,62 @@ def openai_compatible_request(
     return payload
 
 
-def openai_embedding_request(model_id: str, texts: Sequence[str]) -> JsonObject:
-    """Convert ordered text into one OpenAI-compatible embedding request."""
-    return {"model": model_id, "input": list(texts)}
+def openai_embedding_request(
+    model_id: str,
+    texts: Sequence[str],
+    *,
+    dimensions: int | None = None,
+    encoding_format: Literal["float", "base64"] | None = None,
+) -> JsonObject:
+    """Convert ordered text into one OpenAI-compatible embedding request.
+
+    Args:
+        model_id: Served embedding model id.
+        texts: Ordered visible text values to embed.
+        dimensions: Optional output dimensionality the caller requested. Omitted
+            from the wire when absent so the provider's native width applies.
+        encoding_format: Optional caller vector encoding. Omitted when absent so
+            the provider default (``float``) applies.
+
+    Returns:
+        The OpenAI-compatible ``/embeddings`` request body.
+    """
+    request: JsonObject = {"model": model_id, "input": list(texts)}
+    if dimensions is not None:
+        request["dimensions"] = dimensions
+    if encoding_format is not None:
+        request["encoding_format"] = encoding_format
+    return request
+
+
+def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
+    """Convert one canonical image-generation request into the OpenAI wire body.
+
+    Every optional control is omitted when absent so the provider default
+    applies; ``user`` is never forwarded (metadata-only in the manifest).
+
+    Args:
+        model_id: Served image model id.
+        request: Canonical image-generation request.
+
+    Returns:
+        The OpenAI-compatible ``/images/generations`` request body.
+    """
+    body: JsonObject = {"model": model_id, "prompt": request.prompt, "n": request.n}
+    for field in (
+        "size",
+        "quality",
+        "background",
+        "output_format",
+        "output_compression",
+        "moderation",
+        "response_format",
+        "style",
+    ):
+        value = getattr(request, field)
+        if value is not None:
+            body[field] = value
+    return body
 
 
 def openai_compatible_response(
@@ -247,8 +333,69 @@ def openai_embedding_response(payload: JsonObject, *, expected_count: int) -> tu
     return tuple(cast("Embedding", item) for item in ordered)
 
 
+def openai_embedding_response_raw(payload: JsonObject, *, expected_count: int) -> RawEmbeddingBatch:
+    """Convert an OpenAI-compatible embedding response without renormalizing.
+
+    The public embeddings surface returns the provider's exact vectors and
+    bills the reported input tokens, so this parser preserves raw magnitudes
+    and requires the ``usage.prompt_tokens`` count the normalized router-facing
+    :func:`openai_embedding_response` discards.
+
+    Args:
+        payload: Decoded ``/embeddings`` response.
+        expected_count: Number of requested input strings.
+
+    Returns:
+        Ordered raw embeddings with the provider's input-token usage.
+
+    Raises:
+        ProviderResponseError: The provider omitted, duplicated, or malformed
+            vectors, or omitted the input-token usage the surface bills on.
+    """
+    data = require_array(payload.get("data"), "data")
+    if len(data) != expected_count:
+        raise OpenAICompatibleResponseError(
+            f"embedding response count {len(data)} does not match request count {expected_count}"
+        )
+    ordered: list[RawEmbedding | None] = [None] * expected_count
+    for position, value in enumerate(data):
+        item = require_object(value, f"data[{position}]")
+        index_value = item.get("index", position)
+        if not isinstance(index_value, int) or isinstance(index_value, bool):
+            raise OpenAICompatibleResponseError(f"data[{position}].index must be an integer")
+        if index_value < 0 or index_value >= expected_count or ordered[index_value] is not None:
+            raise OpenAICompatibleResponseError(
+                "embedding response indexes must be unique input indexes"
+            )
+        vector = require_array(item.get("embedding"), f"data[{position}].embedding")
+        ordered[index_value] = RawEmbedding(values=_finite_embedding_vector(vector))
+    if any(item is None for item in ordered):
+        raise OpenAICompatibleResponseError("embedding response omitted an input index")
+    usage = require_object(payload.get("usage"), "usage")
+    # The surface bills on this count, so an omitted prompt_tokens is a malformed
+    # response, never the zero that require_integer folds an absent usage field to.
+    prompt_tokens = usage.get("prompt_tokens")
+    if not isinstance(prompt_tokens, int) or isinstance(prompt_tokens, bool) or prompt_tokens < 0:
+        raise OpenAICompatibleResponseError("usage.prompt_tokens must be a non-negative integer")
+    served_model = payload.get("model")
+    return RawEmbeddingBatch(
+        embeddings=tuple(cast("RawEmbedding", item) for item in ordered),
+        prompt_tokens=prompt_tokens,
+        served_model_id=served_model if isinstance(served_model, str) else None,
+    )
+
+
 class OpenAIEmbeddingMixin(ProviderHttpClient):
     """Adds the shared OpenAI-wire embeddings endpoint to one HTTP provider client."""
+
+    def _embedding_model_id(self) -> str:
+        """Return the model id placed on the embeddings wire.
+
+        The configured identity by default; a client whose provider spells the wire id
+        differently from the catalog record (Vertex MaaS collapses a resource path onto
+        ``<publisher>/<model>``) overrides this so both routes name the same model.
+        """
+        return self._model.model_id
 
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
         """Embed ordered text through the configured model without making empty requests.
@@ -261,8 +408,51 @@ class OpenAIEmbeddingMixin(ProviderHttpClient):
         """
         if not texts:
             return ()
-        response = self._post("embeddings", openai_embedding_request(self._model.model_id, texts))
+        response = self._post(
+            "embeddings", openai_embedding_request(self._embedding_model_id(), texts)
+        )
         return openai_embedding_response(response, expected_count=len(texts))
+
+    def embed_raw(
+        self,
+        texts: Sequence[str],
+        *,
+        dimensions: int | None = None,
+        encoding_format: Literal["float"] | None = None,
+    ) -> RawEmbeddingBatch:
+        """Embed ordered text and return raw vectors with input-token usage.
+
+        The public ``/v1/embeddings`` surface serves the provider's exact
+        vectors and bills input tokens, so this sibling of :meth:`embed` keeps
+        raw magnitudes and the ``prompt_tokens`` count. ``base64`` re-emission
+        belongs to the surface response builder, so this convenience wrapper
+        parses numeric vectors only and does not accept ``encoding_format``
+        other than ``float``.
+
+        Args:
+            texts: Ordered visible text values to embed; at least one.
+            dimensions: Optional output dimensionality the caller requested.
+            encoding_format: Optional wire encoding; only ``float`` is decoded here.
+
+        Returns:
+            Ordered raw embeddings with the provider's input-token usage.
+
+        Raises:
+            ValueError: No input text was supplied.
+            ProviderResponseError: The provider response was malformed.
+        """
+        if not texts:
+            raise ValueError("embed_raw requires at least one input text")
+        response = self._post(
+            "embeddings",
+            openai_embedding_request(
+                self._embedding_model_id(),
+                texts,
+                dimensions=dimensions,
+                encoding_format=encoding_format,
+            ),
+        )
+        return openai_embedding_response_raw(response, expected_count=len(texts))
 
 
 class OpenAICompatibleClient(OpenAIEmbeddingMixin):
@@ -284,12 +474,34 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         supports_top_p: bool | None = None,
         supports_top_k: bool = False,
         supports_logprobs: bool = False,
+        supports_frequency_penalty: bool = False,
+        supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
         chat_max_tokens_field: ChatMaxTokensField | None = None,
         sampling_requires_reasoning_none: bool = False,
+        reasoning_output_exposed: bool = False,
+        reasoning_content_native: bool = False,
+        system_messages_leading_only: bool = False,
     ) -> None:
-        """Create one compatible client with explicit model wire capabilities."""
+        """Create one compatible client with explicit model wire capabilities.
+
+        ``reasoning_content_native`` declares that this origin returns the
+        model's chain-of-thought in the standard ``reasoning_content`` field and
+        accepts it back on assistant turns, so the rung is a preserved-thinking
+        carrier route whatever its hostname (a self-hosted vLLM origin with a
+        reasoning parser). Tencent's own origins carry that contract by
+        recognition and need no declaration. The declaration decides the
+        carrier route and exposure only; the ``prompt_cache_key`` node pin stays
+        keyed on Tencent's hosts.
+
+        ``system_messages_leading_only`` declares that this origin's chat
+        template accepts a system message only as the very first message (the
+        official Qwen3.6+ template raises ``System message must be at the
+        beginning.`` for any other position, a second leading system turn
+        included), so every other instruction turn is folded into user text
+        before dispatch instead of 400ing the whole request.
+        """
         super().__init__(
             model=model,
             api_key=api_key,
@@ -302,19 +514,42 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         self._supports_top_p = supports_temperature if supports_top_p is None else supports_top_p
         self._supports_top_k = supports_top_k
         self._supports_logprobs = supports_logprobs
+        self._supports_frequency_penalty = supports_frequency_penalty
+        self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
         self._reasoning_effort = reasoning_effort
         self._token_limit_key: ChatMaxTokensField = chat_max_tokens_field or self.token_limit_key
         self._sampling_requires_reasoning_none = sampling_requires_reasoning_none
+        self._reasoning_output_exposed = reasoning_output_exposed
         self._fireworks_reasoning_route_sha256 = (
             reasoning_content_route_sha256(model) if is_fireworks_base_url(self._base_url) else None
         )
+        # A native ``reasoning_content`` origin returns the model's plaintext
+        # reasoning and accepts it back; the gateway exposes it for display and
+        # round-trips it through a domain-separated opaque carrier, so this rung
+        # is both a carrier route and an exposed-plaintext route. Tencent's own
+        # origins are recognized by host; any other origin declares the contract
+        # per rung. Fireworks keeps its own carrier and wire flag, so the
+        # declaration never doubles a Fireworks rung's route.
+        self._reasoning_content_native = (
+            is_hunyuan_base_url(self._base_url) or reasoning_content_native
+        ) and self._fireworks_reasoning_route_sha256 is None
+        self._hunyuan_reasoning_route_sha256 = (
+            reasoning_content_route_sha256(model) if self._reasoning_content_native else None
+        )
+        # DeepSeek's own API enforces reasoning_content on every assistant
+        # message of the current turn in thinking mode (400 otherwise); both the
+        # streaming wire profile and the buffered request builder read this.
+        self._deepseek_reasoning_history = is_deepseek_base_url(self._base_url)
+        self._system_messages_leading_only = system_messages_leading_only
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
         """Return the Chat Completions wire profile for this connection."""
         return GatewayWireProfile(
             dialect="openai_compatible",
             url=f"{self._base_url}/{self._request_path(self._completion_path())}",
+            embeddings_url=f"{self._base_url}/{self._request_path('embeddings')}",
+            images_url=f"{self._base_url}/{self._request_path('images/generations')}",
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
@@ -322,12 +557,36 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
+            supports_frequency_penalty=self._supports_frequency_penalty,
+            supports_presence_penalty=self._supports_presence_penalty,
             supports_reasoning=self._supports_reasoning,
             reasoning_wire_format=self.reasoning_wire_format,
             reasoning_effort=self._reasoning_effort,
             token_limit_key=self._token_limit_key,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
             fireworks_reasoning_route_sha256=self._fireworks_reasoning_route_sha256,
+            hunyuan_reasoning_route_sha256=self._hunyuan_reasoning_route_sha256,
+            # Expose plaintext reasoning only when the rung explicitly declares
+            # it AND resolves a reasoning-carrier route: an absent capability
+            # fails closed and stays stripped even on the Hunyuan endpoint, so
+            # exposure is per-rung, never per-endpoint.
+            reasoning_output_exposed=(
+                self._reasoning_output_exposed and self._hunyuan_reasoning_route_sha256 is not None
+            ),
+            # The DeepSeek rung replays caller plaintext and backfills the
+            # field WITHOUT the exposure stamp: a house lane that fails every
+            # agent loop by default is wrong, and the stamp only governs
+            # output exposure.
+            deepseek_reasoning_history=self._deepseek_reasoning_history,
+            system_messages_leading_only=self._system_messages_leading_only,
+            # Tencent's prefix cache is per node behind its load balancer;
+            # prompt_cache_key pins a session to one node (verified live
+            # 2026-09-05). The hint stays host-keyed: a rung declaring
+            # ``reasoning_content_native`` says only that its origin speaks the
+            # reasoning_content contract, and a strict compatible server that
+            # does may still reject an unknown top-level field, so the
+            # declaration never widens what is sent, BYOK or not.
+            forwards_prompt_cache_key=is_hunyuan_base_url(self._base_url),
         )
 
     def _completion_path(self) -> str:
@@ -348,6 +607,8 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             reasoning_effort=self._reasoning_effort,
             reasoning_wire_format=self.reasoning_wire_format,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
+            deepseek_reasoning_history=self._deepseek_reasoning_history,
+            system_messages_leading_only=self._system_messages_leading_only,
         )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
@@ -366,9 +627,36 @@ class OpenRouterClient(OpenAICompatibleClient):
     }
     reasoning_wire_format: ClassVar[ReasoningWireFormat] = "reasoning"
 
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the compatible profile with OpenRouter's sticky-routing hint on.
 
-def _openai_message(message: ModelMessage) -> JsonObject:
-    """Convert one EXP message while retaining assistant tool history."""
+        OpenRouter load-balances one model across upstream providers and pins a
+        conversation to the provider that served it only once a cache hit has
+        been observed, keyed by ``session_id`` else the OpenAI-style
+        ``prompt_cache_key`` (its documented fallback sticky key). Without the
+        hint two identical prefixes can land on different providers or nodes,
+        so the miss a caller sees is real and its metering is correct.
+        Forwarding the tenant-namespaced key makes placement deterministic per
+        conversation, and OpenRouter forwards provider-specific fields
+        upstream, so a per-node pin such as Tencent's rides along.
+        """
+        return replace(
+            super().gateway_wire_profile(),
+            forwards_prompt_cache_key=True,
+            forwards_cache_control=True,
+        )
+
+
+def _openai_message(
+    message: ModelMessage, *, deepseek_reasoning_history: bool = False
+) -> JsonObject:
+    """Convert one EXP message while retaining assistant tool history.
+
+    On DeepSeek's own origin every assistant message gains ``reasoning_content: ""``:
+    the provider 400s a tools request when any assistant message of the current
+    turn lacks the field and accepts an empty one everywhere (see
+    ``openai_chat_message`` for the streaming twin of this rule).
+    """
     if message.role == "tool":
         return {
             "role": "tool",
@@ -393,6 +681,8 @@ def _openai_message(message: ModelMessage) -> JsonObject:
             }
             for call in action.tool_calls
         ]
+    if deepseek_reasoning_history:
+        payload["reasoning_content"] = ""
     return payload
 
 
@@ -465,6 +755,31 @@ def _usage(payload: JsonObject) -> Usage | None:
     )
 
 
+def _finite_embedding_vector(values: Sequence[JsonValue]) -> tuple[float, ...]:
+    """Return one finite, non-empty vector from a provider response, unnormalized.
+
+    Args:
+        values: Numeric values in one provider-returned embedding vector.
+
+    Returns:
+        The provider's vector as finite floats in wire order.
+
+    Raises:
+        OpenAICompatibleResponseError: A value is nonnumeric or nonfinite, or the vector is empty.
+    """
+    vector: list[float] = []
+    for index, value in enumerate(values):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise OpenAICompatibleResponseError(f"embedding values[{index}] must be numeric")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise OpenAICompatibleResponseError(f"embedding values[{index}] must be finite")
+        vector.append(numeric)
+    if not vector:
+        raise OpenAICompatibleResponseError("embedding vectors cannot be empty")
+    return tuple(vector)
+
+
 def normalize_embedding_vector(values: Sequence[JsonValue]) -> tuple[float, ...]:
     """Return one finite, non-zero unit vector from a provider response.
 
@@ -477,16 +792,7 @@ def normalize_embedding_vector(values: Sequence[JsonValue]) -> tuple[float, ...]
     Raises:
         OpenAICompatibleResponseError: A value is nonnumeric, nonfinite, or the vector is zero.
     """
-    vector: list[float] = []
-    for index, value in enumerate(values):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise OpenAICompatibleResponseError(f"embedding values[{index}] must be numeric")
-        numeric = float(value)
-        if not math.isfinite(numeric):
-            raise OpenAICompatibleResponseError(f"embedding values[{index}] must be finite")
-        vector.append(numeric)
-    if not vector:
-        raise OpenAICompatibleResponseError("embedding vectors cannot be empty")
+    vector = _finite_embedding_vector(values)
     norm = math.sqrt(sum(item * item for item in vector))
     if norm == 0:
         raise OpenAICompatibleResponseError("embedding vectors cannot have zero norm")

@@ -8,13 +8,13 @@ from pathlib import Path
 from typing import Literal, cast
 
 from exp.common.core.artifacts import stable_id
-from exp.common.models.gateway_catalog import NormalizedGatewayCatalog
+from exp.common.models.gateway_catalog import read_pinned_normalized_snapshot
 from exp.runtime.gateway.budgets import (
     BudgetScope,
     BudgetScopeKind,
     SQLiteBudgetStore,
 )
-from exp.runtime.gateway.contracts import GatewayFailureClass, GatewayUsage, ProjectTarget
+from exp.runtime.gateway.contracts import GatewayFailureClass, ProjectTarget
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import require_gateway_servable_provider
 from exp.runtime.gateway.platform import (
@@ -57,6 +57,7 @@ from exp.runtime.gateway.platform import (
     UsageTerminalCount,
     VirtualKeyRecord,
 )
+from exp.runtime.gateway.snapshot_integrity import refuse_self_inconsistent_snapshot
 from exp.runtime.gateway.sqlite.migrations import connect_database
 from exp.runtime.gateway.sqlite.platform_records import (
     alias_record as _alias_record,
@@ -84,6 +85,9 @@ from exp.runtime.gateway.sqlite.platform_records import (
 )
 from exp.runtime.gateway.sqlite.platform_records import (
     reservation_record as _reservation_record,
+)
+from exp.runtime.gateway.sqlite.platform_records import (
+    usage_record as _usage_record,
 )
 from exp.runtime.gateway.sqlite.provider_commands import sqlite_connection_config
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
@@ -294,7 +298,7 @@ class SQLiteGatewayPlatform:
                 pool_id=command.scope.pool_id,
                 deployment_id=command.scope.deployment_id,
             ),
-            limit_micro_usd=command.limit_micro_usd,
+            limit_nano_usd=command.limit_nano_usd,
             replace=command.replace,
         )
         return NaturalMutationOutcome(
@@ -436,6 +440,7 @@ class SQLiteGatewayPlatform:
                         'Literal["access_key_pair", "api_key"]', str(row["bedrock_auth_mode"])
                     )
                 ),
+                trusted_custom_origin=bool(row["trusted_custom_origin"]),
                 connection_sha256=str(row["connection_sha256"]),
                 active=bool(row["active"]) and row["active_revision_id"] == row["revision_id"],
                 created_at=_datetime(row["created_at"]),
@@ -481,11 +486,11 @@ class SQLiteGatewayPlatform:
             if not snapshot_path.is_relative_to(state_dir):
                 raise RuntimeError("catalog snapshot reference escapes gateway state")
             try:
-                catalog = NormalizedGatewayCatalog.model_validate_json(snapshot_path.read_bytes())
+                catalog = read_pinned_normalized_snapshot(
+                    snapshot_path.read_bytes(), catalog_sha256
+                )
             except (OSError, ValueError) as exc:
                 raise RuntimeError("catalog snapshot is unreadable or invalid") from exc
-            if catalog.identity_sha256() != catalog_sha256:
-                raise RuntimeError("catalog snapshot digest differs from SQLite authority")
             for pool in catalog.pools:
                 revision_id = stable_id(
                     "gateway-exact-pool-revision",
@@ -528,10 +533,10 @@ class SQLiteGatewayPlatform:
                     pool_id=item.budget.scope.pool_id,
                     deployment_id=item.budget.scope.deployment_id,
                 ),
-                limit_micro_usd=item.budget.limit_micro_usd,
-                reserved_micro_usd=item.reserved_micro_usd,
-                settled_micro_usd=item.settled_micro_usd,
-                remaining_micro_usd=item.remaining_micro_usd,
+                limit_nano_usd=item.budget.limit_nano_usd,
+                reserved_nano_usd=item.reserved_nano_usd,
+                settled_nano_usd=item.settled_nano_usd,
+                remaining_nano_usd=item.remaining_nano_usd,
                 unknown_cost_attempts=item.unknown_cost_attempts,
                 exhausted=item.exhausted,
                 created_at=item.budget.created_at,
@@ -557,7 +562,7 @@ class SQLiteGatewayPlatform:
                 deployment=request.deployment,
                 attempt_ordinal=request.attempt_ordinal,
                 route_depth=request.route_depth,
-                maximum_cost_micro_usd=request.maximum_cost_micro_usd,
+                maximum_cost_nano_usd=request.maximum_cost_nano_usd,
             )
         except sqlite3.IntegrityError:
             concurrent = self._attempt_for_reservation(request)
@@ -573,7 +578,17 @@ class SQLiteGatewayPlatform:
         self,
         request: AttemptSettlementRequest,
     ) -> AttemptSettlementRecord:
-        """Settle only an attempt proven to belong to the requested tenant."""
+        """Settle a tenant's attempt and verify exact replay against durable evidence.
+
+        Args:
+            request: Tenant-scoped terminal outcome and provider usage.
+
+        Returns:
+            The persisted outcome with all frozen rates and observed token subsets.
+
+        Raises:
+            ValueError: Tenant ownership or replay evidence differs from the row.
+        """
         self._reservation(
             organization_id=request.organization_id,
             attempt_id=request.attempt_id,
@@ -593,20 +608,7 @@ class SQLiteGatewayPlatform:
             raise ValueError(
                 "attempt settlement replay cannot finalize its non-terminal parent request"
             )
-        usage = (
-            None
-            if row["input_tokens"] is None or row["output_tokens"] is None
-            else GatewayUsage(
-                input_tokens=int(row["input_tokens"]),
-                cached_input_tokens=(
-                    None if row["cached_input_tokens"] is None else int(row["cached_input_tokens"])
-                ),
-                output_tokens=int(row["output_tokens"]),
-                reasoning_tokens=(
-                    None if row["reasoning_tokens"] is None else int(row["reasoning_tokens"])
-                ),
-            )
-        )
+        usage = _usage_record(row)
         settlement = AttemptSettlementRecord(
             reservation=_reservation_record(row, organization_id=request.organization_id),
             state=AttemptTerminalState(str(row["state"])),
@@ -618,8 +620,8 @@ class SQLiteGatewayPlatform:
             ),
             usage=usage,
             usage_source=AttemptUsageSource(str(row["usage_source"] or "unknown")),
-            estimated_cost_micro_usd=_optional_int(row["estimated_cost_micro_usd"]),
-            settled_micro_usd=_optional_int(row["budget_settled_micro_usd"]),
+            estimated_cost_nano_usd=_optional_int(row["estimated_cost_nano_usd"]),
+            settled_nano_usd=_optional_int(row["budget_settled_nano_usd"]),
             first_token_at=_optional_datetime(row["first_token_at"]),
         )
         _require_settlement_replay(settlement, request=request)
@@ -648,7 +650,7 @@ class SQLiteGatewayPlatform:
                     cached_input_tokens=item.cached_input_tokens,
                     output_tokens=item.output_tokens,
                     reasoning_tokens=item.reasoning_tokens,
-                    known_estimated_cost_micro_usd=item.known_estimated_cost_micro_usd,
+                    known_estimated_cost_nano_usd=item.known_estimated_cost_nano_usd,
                     unknown_cost_attempts=item.unknown_cost_attempts,
                     total_latency_ms=item.total_latency_ms,
                     average_latency_ms=item.average_latency_ms,
@@ -670,7 +672,7 @@ class SQLiteGatewayPlatform:
                     cached_input_tokens=item.cached_input_tokens,
                     output_tokens=item.output_tokens,
                     reasoning_tokens=item.reasoning_tokens,
-                    known_estimated_cost_micro_usd=item.known_estimated_cost_micro_usd,
+                    known_estimated_cost_nano_usd=item.known_estimated_cost_nano_usd,
                     unknown_cost_attempts=item.unknown_cost_attempts,
                     terminal_counts=tuple(
                         UsageTerminalCount(
@@ -832,11 +834,7 @@ class SQLiteGatewayPlatform:
                 snapshot_ref = ? OR catalog_sha256 = ?
             )
             """,
-            (
-                command.organization_id,
-                command.snapshot_ref,
-                command.catalog_sha256,
-            ),
+            (command.organization_id, command.snapshot_ref, command.catalog_sha256),
         )
         if rows:
             if len(rows) != 1 or (
@@ -845,6 +843,10 @@ class SQLiteGatewayPlatform:
             ) != (command.snapshot_ref, command.catalog_sha256):
                 raise ValueError("catalog snapshot reference conflicts with existing authority")
             return
+        # Never pin a self-inconsistent snapshot (the persistent hydration bug).
+        refuse_self_inconsistent_snapshot(
+            self.database_path.parent, command.snapshot_ref, command.catalog_sha256
+        )
         try:
             self.control.register_catalog_snapshot(
                 organization_id=command.organization_id,
@@ -857,11 +859,7 @@ class SQLiteGatewayPlatform:
                 SELECT snapshot_ref, catalog_sha256 FROM catalog_snapshot_refs
                 WHERE organization_id = ? AND snapshot_ref = ? AND catalog_sha256 = ?
                 """,
-                (
-                    command.organization_id,
-                    command.snapshot_ref,
-                    command.catalog_sha256,
-                ),
+                (command.organization_id, command.snapshot_ref, command.catalog_sha256),
             )
             if len(concurrent) != 1:
                 raise

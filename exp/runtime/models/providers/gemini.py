@@ -59,8 +59,13 @@ def gemini_generate_response(
         The typed assistant action, served model identity, and observed economics.
 
     Raises:
+        ProviderRefusalError: Google blocked the prompt itself (``promptFeedback.blockReason``)
+            or stopped the candidate on a safety, copyright, or sensitive-information reason.
         ProviderResponseError: The response omits a usable candidate or has malformed content.
     """
+    prompt_block = _gemini_prompt_block_signal(payload)
+    if prompt_block is not None:
+        raise ProviderRefusalError(provider="gemini", signal=prompt_block)
     candidates = require_array(payload.get("candidates"), "Gemini candidates")
     if not candidates:
         raise ProviderResponseError("Gemini response has no candidates")
@@ -113,6 +118,8 @@ class GeminiClient(ProviderHttpClient):
         supports_top_p: bool = True,
         supports_top_k: bool = False,
         supports_logprobs: bool = False,
+        supports_frequency_penalty: bool = False,
+        supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
     ) -> None:
@@ -129,6 +136,8 @@ class GeminiClient(ProviderHttpClient):
         self._supports_top_p = supports_top_p
         self._supports_top_k = supports_top_k
         self._supports_logprobs = supports_logprobs
+        self._supports_frequency_penalty = supports_frequency_penalty
+        self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
         self._reasoning_effort = reasoning_effort
 
@@ -150,6 +159,8 @@ class GeminiClient(ProviderHttpClient):
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
+            supports_frequency_penalty=self._supports_frequency_penalty,
+            supports_presence_penalty=self._supports_presence_penalty,
             supports_reasoning=self._supports_reasoning,
             reasoning_wire_format="gemini_thinking",
             reasoning_effort=self._reasoning_effort,
@@ -235,20 +246,77 @@ def _gemini_tool_call(value: JsonValue, index: int) -> ToolCall:
 
 
 def _gemini_usage(payload: JsonObject) -> Usage | None:
-    """Read Gemini's usage metadata with cached tokens treated as an input subset."""
+    """Read Gemini usage, folding additive thoughts into billed output tokens.
+
+    Google defines ``thoughtsTokenCount`` as additive to ``candidatesTokenCount``
+    (``totalTokenCount`` is prompt + candidates + thoughts, and response pricing
+    is the sum of output and thinking tokens). An omitted thoughts count stays
+    zero through the shared integer reader, matching the native mapper's fold
+    when the field is present.
+
+    Args:
+        payload: Decoded completed Gemini response.
+
+    Returns:
+        Observed token usage, or ``None`` when the payload omits usage metadata.
+
+    Raises:
+        ProviderResponseError: A usage field is present but not a non-negative integer.
+    """
     raw = payload.get("usageMetadata")
     if raw is None:
         return None
     usage = require_object(raw, "Gemini usageMetadata")
+    candidates_tokens = require_integer(
+        usage.get("candidatesTokenCount"), "Gemini candidatesTokenCount"
+    )
+    thoughts_tokens = require_integer(usage.get("thoughtsTokenCount"), "Gemini thoughtsTokenCount")
     return Usage(
         input_tokens=require_integer(usage.get("promptTokenCount"), "Gemini promptTokenCount"),
-        output_tokens=require_integer(
-            usage.get("candidatesTokenCount"), "Gemini candidatesTokenCount"
-        ),
+        output_tokens=candidates_tokens + thoughts_tokens,
         cached_input_tokens=require_integer(
             usage.get("cachedContentTokenCount"), "Gemini cachedContentTokenCount"
         ),
     )
+
+
+# Finish and block reasons Google reports for content its safety systems
+# refused; the prompt-level block adds the image-specific reason.
+_GEMINI_SAFETY_REASONS: frozenset[str] = frozenset({"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"})
+_GEMINI_PROMPT_SAFETY_REASONS: frozenset[str] = _GEMINI_SAFETY_REASONS | {"IMAGE_SAFETY"}
+
+
+def _gemini_prompt_block_signal(payload: JsonObject) -> ProviderRefusalSignal | None:
+    """Map a prompt-level block to a content-free refusal category.
+
+    A blocked prompt arrives as ``promptFeedback.blockReason`` with no
+    candidates at all, so it must be read before the candidate contract is
+    enforced. ``BLOCK_REASON_UNSPECIFIED`` is the enum default and, like
+    ratings-only feedback, means the prompt was not blocked.
+
+    Args:
+        payload: Decoded Gemini response object.
+
+    Returns:
+        The refusal signal for a blocked prompt, or ``None`` when generation ran.
+
+    Raises:
+        ProviderResponseError: ``promptFeedback`` is not an object, or its
+            ``blockReason`` is not text.
+    """
+    raw = payload.get("promptFeedback")
+    if raw is None:
+        return None
+    feedback = require_object(raw, "Gemini promptFeedback")
+    raw_reason = feedback.get("blockReason")
+    if raw_reason is None:
+        return None
+    reason = require_string(raw_reason, "Gemini promptFeedback.blockReason")
+    if reason == "BLOCK_REASON_UNSPECIFIED":
+        return None
+    if reason in _GEMINI_PROMPT_SAFETY_REASONS:
+        return ProviderRefusalSignal.SAFETY
+    return ProviderRefusalSignal.PROVIDER_REFUSAL
 
 
 def _gemini_refusal_signal(value: object) -> ProviderRefusalSignal | None:
@@ -260,7 +328,7 @@ def _gemini_refusal_signal(value: object) -> ProviderRefusalSignal | None:
     Returns:
         A normalized refusal signal, or ``None`` for ordinary terminal reasons.
     """
-    if value in {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"}:
+    if isinstance(value, str) and value in _GEMINI_SAFETY_REASONS:
         return ProviderRefusalSignal.SAFETY
     if value == "RECITATION":
         return ProviderRefusalSignal.COPYRIGHT

@@ -57,8 +57,11 @@ def test_maintained_sampling_pins_flow_into_resolved_capabilities() -> None:
     assert not pinned.capabilities.supports_temperature
     assert pinned.capabilities.supports_reasoning
     assert pinned.capabilities.reasoning_effort == "medium"
+    # haiku is budgeted-enabled reasoning: it reasons and keeps ordinary
+    # sampling (no temperature pin), but carries no effort-ladder pin of its
+    # own beyond the shared default.
     assert unpinned.capabilities.supports_temperature
-    assert unpinned.capabilities.reasoning_effort is None
+    assert unpinned.capabilities.supports_reasoning
 
 
 def test_unknown_model_keeps_every_capability_and_price_unknown() -> None:
@@ -128,18 +131,23 @@ def test_router_candidate_role_requires_prices_and_both_token_limits() -> None:
 
 
 def test_catalog_request_shaping_capability_reaches_openai_runtime_metadata() -> None:
-    """OpenAI reasoning models resolve with temperature disabled for request shaping."""
-    resolved = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.4-mini"))
+    """Reasoning-only OpenAI models resolve with temperature disabled for request shaping.
+
+    Models with a documented "none" effort (gpt-5.4-mini here) instead keep
+    temperature enabled behind the sampling_requires_reasoning_none hatch.
+    """
+    resolved = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5-mini"))
+    hatch = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.4-mini"))
 
     assert not resolved.capabilities.supports_temperature
+    assert hatch.capabilities.supports_temperature
+    assert hatch.capabilities.sampling_requires_reasoning_none
 
 
 def test_reasoning_capable_models_resolve_with_the_default_medium_pin() -> None:
     """Models proven to accept reasoning effort default to medium; others stay unpinned."""
     reasoning = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.6-luna"))
-    plain = resolve_discovered_model(
-        DiscoveredModel(provider="anthropic", model="claude-haiku-4-5")
-    )
+    plain = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-4o"))
     embedding = resolve_discovered_model(
         DiscoveredModel(provider="openai", model="text-embedding-3-small")
     )
@@ -218,3 +226,28 @@ def test_connection_names_and_aliases_are_readable_and_collision_safe() -> None:
     assert (
         derive_model_alias("gemini", "models/gemini-3.5-flash", frozenset()) == "gemini-3-5-flash"
     )
+
+
+def test_anthropic_point_release_resolves_a_reasoning_route_without_prices() -> None:
+    """A freshly launched point release must not degrade to a non-reasoning route.
+
+    claude-fable-5-1 reached production as a non-reasoning route (every
+    effort-carrying Claude Code request got a named 400) because the bare
+    listing entry resolved no metadata. With the explicit 5.1 record the
+    route carries its full verified contract; a future unrecorded minor
+    (sonnet-5-2 here) still inherits the generation's controls while its
+    prices stay unknown so priced lanes fail closed.
+    """
+    recorded = resolve_discovered_model(
+        DiscoveredModel(provider="anthropic", model="claude-fable-5-1")
+    )
+    assert recorded.capabilities.supports_reasoning is True
+    assert recorded.capabilities.supports_top_k is False
+    assert recorded.capabilities.input_cost_per_million_tokens_usd == 10.0
+    assert recorded.capabilities.cached_input_cost_per_million_tokens_usd == 0.25
+
+    inherited = resolve_discovered_model(
+        DiscoveredModel(provider="anthropic", model="claude-sonnet-5-2")
+    )
+    assert inherited.capabilities.supports_reasoning is True
+    assert inherited.capabilities.input_cost_per_million_tokens_usd is None

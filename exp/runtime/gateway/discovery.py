@@ -22,6 +22,10 @@ class PublishedAliasMetadata:
     """
 
     supports_completions: bool | None = None
+    supports_image_input: bool | None = None
+    supports_video_input: bool | None = None
+    supports_audio_input: bool | None = None
+    supports_pdf_input: bool | None = None
     supports_tools: bool | None = None
     supports_structured_output: bool | None = None
     supports_temperature: bool | None = None
@@ -40,14 +44,18 @@ class PublishedAliasMetadata:
     maximum_top_k: int | None = None
     maximum_output_tokens: int | None = None
     context_window_tokens: int | None = None
-    input_micro_usd_per_million_tokens: int | None = None
-    output_micro_usd_per_million_tokens: int | None = None
-    cached_input_micro_usd_per_million_tokens: int | None = None
+    input_nano_usd_per_million_tokens: int | None = None
+    output_nano_usd_per_million_tokens: int | None = None
+    cached_input_nano_usd_per_million_tokens: int | None = None
 
     def extension_fields(self) -> JsonObject:
         """Return only the declared extension fields for one public model object."""
         fields: JsonObject = {}
         _put_optional(fields, "supports_completions", self.supports_completions)
+        _put_optional(fields, "supports_image_input", self.supports_image_input)
+        _put_optional(fields, "supports_video_input", self.supports_video_input)
+        _put_optional(fields, "supports_audio_input", self.supports_audio_input)
+        _put_optional(fields, "supports_pdf_input", self.supports_pdf_input)
         _put_optional(fields, "supports_tools", self.supports_tools)
         _put_optional(fields, "supports_structured_output", self.supports_structured_output)
         _put_optional(fields, "supports_temperature", self.supports_temperature)
@@ -72,15 +80,15 @@ class PublishedAliasMetadata:
         _put_optional(fields, "context_window_tokens", self.context_window_tokens)
         pricing: JsonObject = {}
         _put_optional(
-            pricing, "input_micro_usd_per_million_tokens", self.input_micro_usd_per_million_tokens
+            pricing, "input_nano_usd_per_million_tokens", self.input_nano_usd_per_million_tokens
         )
         _put_optional(
-            pricing, "output_micro_usd_per_million_tokens", self.output_micro_usd_per_million_tokens
+            pricing, "output_nano_usd_per_million_tokens", self.output_nano_usd_per_million_tokens
         )
         _put_optional(
             pricing,
-            "cached_input_micro_usd_per_million_tokens",
-            self.cached_input_micro_usd_per_million_tokens,
+            "cached_input_nano_usd_per_million_tokens",
+            self.cached_input_nano_usd_per_million_tokens,
         )
         if pricing:
             fields["pricing"] = pricing
@@ -109,6 +117,12 @@ def published_alias_metadata(
     prices = deployment.gateway.prices
     return PublishedAliasMetadata(
         supports_completions=_completion_support(capabilities),
+        # Image, video, and audio input are route facts, not model facts: the alias
+        # serves media only when its deployment's wire carries it.
+        supports_image_input=deployment.gateway.capabilities.supports_image_input,
+        supports_video_input=deployment.gateway.capabilities.supports_video_input,
+        supports_audio_input=deployment.gateway.capabilities.supports_audio_input,
+        supports_pdf_input=deployment.gateway.capabilities.supports_pdf_input,
         supports_tools=None if capabilities is None else capabilities.supports_tools,
         supports_structured_output=(
             None if capabilities is None else capabilities.supports_structured_output
@@ -137,11 +151,9 @@ def published_alias_metadata(
         context_window_tokens=(
             None if capabilities is None else capabilities.context_window_tokens
         ),
-        input_micro_usd_per_million_tokens=prices.input_micro_usd_per_million_tokens,
-        output_micro_usd_per_million_tokens=prices.output_micro_usd_per_million_tokens,
-        cached_input_micro_usd_per_million_tokens=(
-            prices.cached_input_micro_usd_per_million_tokens
-        ),
+        input_nano_usd_per_million_tokens=prices.input_nano_usd_per_million_tokens,
+        output_nano_usd_per_million_tokens=prices.output_nano_usd_per_million_tokens,
+        cached_input_nano_usd_per_million_tokens=(prices.cached_input_nano_usd_per_million_tokens),
     )
 
 

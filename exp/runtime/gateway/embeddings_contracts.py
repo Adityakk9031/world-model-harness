@@ -1,0 +1,95 @@
+"""Canonical embeddings request contract, parallel to the chat ``GatewayRequest``."""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import Field, field_validator
+
+from exp.common.core.artifacts import ContractModel
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
+from exp.runtime.gateway.decisions_contracts import DecisionRequest
+from exp.runtime.gateway.images_contracts import ImagesRequest
+from exp.runtime.gateway.ledger_valuation import require_representable_nano_usd
+
+
+class EmbeddingsRequest(ContractModel):
+    """Canonical, provider-neutral embeddings request.
+
+    Deliberately parallel to :class:`~exp.runtime.gateway.contracts.GatewayRequest`
+    rather than a mode of it: the embeddings surface is message-less and
+    non-streaming, while ``GatewayRequest`` hard-requires ``messages`` and is
+    admitted stream-only. Reusing that contract would have forced either a
+    message-less exception or a stream-forced embeddings dispatch, so the two
+    surfaces stay separate. It lives in its own module so the already
+    line-budgeted ``contracts`` module carries only the shared enum member.
+    """
+
+    surface: Literal[GatewayApiSurface.EMBEDDINGS] = GatewayApiSurface.EMBEDDINGS
+    inputs: tuple[str, ...] = Field(min_length=1)
+    dimensions: int | None = Field(default=None, gt=0)
+    encoding_format: Literal["float", "base64"] | None = None
+    user: str | None = Field(default=None, max_length=1024)
+    """End-user attribution from the OpenAI ``user`` field: content-free and never a credential."""
+
+    @property
+    def attribution_label(self) -> str | None:
+        """The end-user attribution label, per the OpenAI spec.
+
+        The embeddings body carries only the ``user`` field (no
+        ``safety_identifier``), so the label is exactly that field; hosts read
+        it off every serving request at accept, whichever surface it came in on.
+
+        Returns:
+            The attribution label, or ``None`` when the caller sent no ``user``.
+        """
+        return self.user
+
+    @field_validator("inputs")
+    @classmethod
+    def _require_nonempty_inputs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Reject empty input strings, mirroring the provider's own rejection.
+
+        Args:
+            value: Ordered visible text inputs to embed.
+
+        Returns:
+            The unchanged validated inputs.
+
+        Raises:
+            ValueError: An input string is empty.
+        """
+        if any(not text for text in value):
+            raise ValueError("embedding inputs must not be empty strings")
+        return value
+
+
+ServingRequest = GatewayRequest | EmbeddingsRequest | ImagesRequest | DecisionRequest
+"""One admitted serving request across every public surface.
+
+The money, auth, and accounting seams widen from ``GatewayRequest`` to this
+union so a chat-assuming reader cannot duck-type onto an embeddings request and
+touch an absent leg (messages, output tokens): ``ty`` enumerates every reader
+that must now handle the embeddings and images arms, and each branches
+exhaustively.
+"""
+
+
+def embeddings_input_ceiling_nano_usd(
+    *,
+    input_tokens: int,
+    input_rate: int | None,
+) -> int | None:
+    """Return the conservative input-only reservation ceiling for one embeddings call.
+
+    ``input_tokens`` is the request's estimated input reservation (there is no
+    output leg and no excluded provider carrier), so only the input rate
+    applies. A missing rate unprices the route (``None``); a ceiling past the
+    int8 ledger column raises ``NanoUsdOverflowError`` like the completion path.
+    """
+    if input_rate is None:
+        return None
+    return require_representable_nano_usd(
+        (input_tokens * input_rate + 999_999) // 1_000_000,
+        what="embeddings reservation ceiling",
+    )

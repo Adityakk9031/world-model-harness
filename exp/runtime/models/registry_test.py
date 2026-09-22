@@ -22,13 +22,16 @@ from exp.common.models import (
 )
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.preflight import CapabilityRequirement, ModelCapabilityError
+from exp.runtime.models.providers.anthropic import AnthropicClient
 from exp.runtime.models.providers.azure import AzureClient
+from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.tinker_sampling import (
     TinkerOptionalDependencyError,
     TinkerSample,
     TinkerSampler,
 )
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
+from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
 from exp.runtime.models.registry import ModelConnectionError, RuntimeModelCatalog
 
 _DEFAULT_CAPABILITIES = ModelCapabilities(
@@ -88,6 +91,51 @@ def _catalog(
     )
 
 
+def test_typesafe_resolves_native_client_without_changing_capability_identity() -> None:
+    """The registry adds a decision client, not conversational or embedding support."""
+    declared = ModelCapabilities(supports_completions=False, supports_embeddings=False)
+    runtime = RuntimeModelCatalog(
+        _catalog(provider="typesafe", capabilities=declared),
+        environment={"FIXTURE_API_KEY": "provider-secret-canary"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = runtime.resolve("fixture-model")
+    assert isinstance(resolved.client, TypeSafeClient)
+    assert resolved.client.gateway_wire_profile().url == f"{TYPESAFE_BASE_URL}/systemone"
+    assert resolved.embedding_client is None
+    assert resolved.capabilities == declared
+    assert resolved.snapshot.capabilities_sha256 == declared.identity_sha256()
+    assert "provider-secret-canary" not in repr(resolved)
+
+
+def test_typesafe_preserves_fixed_origin_policy_and_trusted_https_override() -> None:
+    """Custom endpoints stay denied unless the existing explicit trust opt-in is present."""
+    with pytest.raises(ValueError, match="built-in official endpoint"):
+        _catalog(provider="typesafe", base_url="https://example.test/v1")
+    with pytest.raises(ValueError, match="https base_url"):
+        ConnectionConfig(
+            provider="typesafe",
+            base_url="http://127.0.0.1:9/v1",
+            api_key_env="FIXTURE_API_KEY",
+            trusted_custom_origin=True,
+        )
+    catalog = _catalog(provider="typesafe")
+    connection = ConnectionConfig(
+        provider="typesafe",
+        base_url="https://example.test/v1",
+        api_key_env="FIXTURE_API_KEY",
+        trusted_custom_origin=True,
+    )
+    runtime = RuntimeModelCatalog(
+        catalog.model_copy(update={"connections": {"primary": connection}}),
+        environment={"FIXTURE_API_KEY": "provider-secret-canary"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    client = runtime.resolve("fixture-model").client
+    assert isinstance(client, TypeSafeClient)
+    assert client.gateway_wire_profile().url == "https://example.test/v1/systemone"
+
+
 def test_snapshot_is_credential_free_and_records_capability_digest() -> None:
     """Static identity resolves before credential reads or provider construction.
 
@@ -129,6 +177,78 @@ def test_foundry_catalog_resolution_uses_model_inference_token_field() -> None:
 
     assert isinstance(resolved.client, AzureClient)
     assert resolved.client.gateway_wire_profile().token_limit_key == "max_tokens"
+
+
+def test_azure_foundry_routes_a_known_anthropic_model_over_the_native_messages_wire() -> None:
+    """A known Anthropic model on an Azure (Foundry) connection dispatches over the
+    NATIVE Anthropic Messages API at /anthropic/v1 with Bearer auth, not the
+    OpenAI-deployments wire (which 404s api_not_supported for Claude on Foundry)."""
+    # A `/models`-spelled Foundry endpoint must still collapse to the resource
+    # root's /anthropic/v1, never `/models/anthropic/v1`.
+    catalog = ModelCatalog(
+        connections={
+            "primary": ConnectionConfig(
+                provider="azure",
+                base_url="https://silen-resource.services.ai.azure.com/models",
+                api_key_env="FIXTURE_API_KEY",
+                api_version="2024-10-21",
+            )
+        },
+        models={
+            "opus": ModelRecord(
+                connection="primary",
+                model="claude-opus-4-6",
+                billing_source=BillingSource.HOST_MANAGED,
+                capabilities=ModelCapabilities(supports_completions=True, supports_reasoning=True),
+            )
+        },
+        roles=ModelRoles(candidates=("opus",), incumbent="opus"),
+    )
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "foundry-secret"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    resolved = runtime.resolve("opus")
+
+    assert isinstance(resolved.client, AnthropicClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.dialect == "anthropic_messages"
+    assert profile.url == "https://silen-resource.services.ai.azure.com/anthropic/v1/messages"
+    assert profile.headers["Authorization"] == "Bearer foundry-secret"
+    assert "x-api-key" not in profile.headers
+
+
+def test_azure_non_anthropic_model_keeps_the_openai_deployments_wire() -> None:
+    """A non-Anthropic model on the SAME Azure connection still uses AzureClient,
+    so the mixed Foundry connection (glm/kimi/deepseek + Claude) routes per model."""
+    catalog = ModelCatalog(
+        connections={
+            "primary": ConnectionConfig(
+                provider="azure",
+                base_url="https://silen-resource.services.ai.azure.com",
+                api_key_env="FIXTURE_API_KEY",
+                api_version="2024-10-21",
+            )
+        },
+        models={
+            "glm": ModelRecord(
+                connection="primary",
+                model="FW-GLM-5.2",
+                billing_source=BillingSource.HOST_MANAGED,
+                capabilities=ModelCapabilities(supports_completions=True),
+            )
+        },
+        roles=ModelRoles(candidates=("glm",), incumbent="glm"),
+    )
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "foundry-secret"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    assert isinstance(runtime.resolve("glm").client, AzureClient)
 
 
 def test_snapshots_preserve_per_model_billing_source_on_one_connection() -> None:
@@ -451,3 +571,78 @@ def test_tinker_resolution_reports_a_missing_optional_dependency(
 
     with pytest.raises(ModelConnectionError, match="uv sync --extra sft"):
         catalog.resolve("fixture-model")
+
+
+def test_resolution_threads_reasoning_content_native_to_compatible_rungs() -> None:
+    """A flagged openai-compatible rung on any origin resolves a preserved-thinking route."""
+    catalog = RuntimeModelCatalog(
+        _catalog(
+            provider="openai-compatible",
+            base_url="https://hy4-preview--serve.modal.run/v1",
+            capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                reasoning_output_exposed=True,
+                reasoning_content_native=True,
+            ),
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAICompatibleClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.reasoning_output_exposed is True
+    assert profile.forwards_prompt_cache_key is False
+
+
+def test_openrouter_resolution_forwards_the_prompt_cache_key_hint() -> None:
+    """The catalog's openrouter provider resolves to a rung that routes by the hint."""
+    catalog = RuntimeModelCatalog(
+        _catalog(provider="openrouter"),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAICompatibleClient)
+    assert resolved.client.gateway_wire_profile().forwards_prompt_cache_key is True
+
+
+def test_resolution_threads_system_messages_leading_only_to_compatible_rungs() -> None:
+    """A flagged openai-compatible rung resolves a profile that folds non-leading system turns."""
+    catalog = RuntimeModelCatalog(
+        _catalog(
+            provider="openai-compatible",
+            base_url="https://gateway.xplabs.ai/qwen/v1",
+            capabilities=ModelCapabilities(system_messages_leading_only=True),
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAICompatibleClient)
+    assert resolved.client.gateway_wire_profile().system_messages_leading_only is True
+
+
+def test_anthropic_connection_geography_reaches_both_client_paths() -> None:
+    """Catalog construction supplies both gateway and ordinary completion constraints."""
+    catalog = _catalog(provider="anthropic")
+    catalog = catalog.model_copy(
+        update={
+            "connections": {
+                "primary": ConnectionConfig(
+                    provider="anthropic", api_key_env="FIXTURE_API_KEY", inference_geo="us"
+                )
+            }
+        }
+    )
+    runtime = RuntimeModelCatalog(
+        catalog, environment={"FIXTURE_API_KEY": "fixture"}, transport_factory=ScriptedJsonTransport
+    )
+    resolved = runtime.resolve(next(iter(catalog.models)))
+    assert isinstance(resolved.client, AnthropicClient)
+    assert resolved.client.gateway_wire_profile().inference_geo == "us"
+    payload = resolved.client._build_request(
+        ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
+    )
+    assert payload["inference_geo"] == "us"

@@ -14,7 +14,7 @@ zero means the provider documents no separate charge for that cache operation.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 _SNAPSHOT_SUFFIX_PATTERN = re.compile(r"(?:[-@]\d{8}|-\d{4}-\d{2}-\d{2}|-latest)$")
@@ -33,7 +33,19 @@ class KnownModel:
     supports_top_p: bool | None = None
     supports_top_k: bool | None = None
     supports_logprobs: bool | None = None
+    supports_frequency_penalty: bool | None = None
+    supports_presence_penalty: bool | None = None
     supports_reasoning_effort: bool = False
+    supports_reasoning: bool | None = None
+    """Whether the model reasons at all, independent of effort-ladder control.
+
+    ``None`` defers to ``supports_reasoning_effort`` (the historical
+    derivation, kept for backward compatibility). An explicit ``True`` marks a
+    reasoning-capable model whose depth is NOT an OpenAI-style effort ladder —
+    for example an Anthropic budgeted-enabled model whose thinking is expressed
+    through ``budget_tokens`` — so its thinking config is honored even though
+    ``supports_reasoning_effort`` is ``False``.
+    """
     reasoning_effort: (
         Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"] | None
     ) = None
@@ -67,6 +79,7 @@ def _chat(
     supports_logprobs: bool = False,
     supports_structured_output: bool = True,
     supports_reasoning_effort: bool = False,
+    supports_reasoning: bool | None = None,
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"]
     | None = None,
     sampling_requires_reasoning_none: bool = False,
@@ -94,6 +107,8 @@ def _chat(
         supports_structured_output: Whether the model supports structured outputs.
         supports_reasoning_effort: Whether the model accepts an explicit reasoning-effort
             parameter on the OpenAI Responses API.
+        supports_reasoning: Whether the model reasons at all when it does not accept an
+            effort ladder; ``None`` defers to ``supports_reasoning_effort``.
         reasoning_effort: Valid default effort for this exact model.
         sampling_requires_reasoning_none: Whether sampling controls require exact effort none.
         chat_max_tokens_field: Exact Chat Completions output-limit field, when applicable.
@@ -117,6 +132,7 @@ def _chat(
         supports_top_k=supports_top_k,
         supports_logprobs=supports_logprobs,
         supports_reasoning_effort=supports_reasoning_effort,
+        supports_reasoning=supports_reasoning,
         reasoning_effort=(reasoning_effort or "medium" if supports_reasoning_effort else None),
         sampling_requires_reasoning_none=sampling_requires_reasoning_none,
         chat_max_tokens_field=chat_max_tokens_field,
@@ -144,8 +160,19 @@ def _anthropic_chat(
     context_window_tokens: int | None = None,
     maximum_output_tokens: int | None = None,
     adaptive_reasoning: bool = False,
+    supports_reasoning: bool | None = None,
+    sampling_requires_reasoning_none: bool = False,
 ) -> KnownModel:
-    """Describe one native Anthropic Messages model's exact generation controls."""
+    """Describe one native Anthropic Messages model's exact generation controls.
+
+    ``adaptive_reasoning`` is the xhigh-effort adaptive generation: it pins
+    temperature and top_p to their thinking-on values for the whole route. A
+    budgeted-enabled model instead passes ``supports_reasoning=True`` with
+    ``sampling_requires_reasoning_none=True`` and keeps ordinary sampling —
+    its thinking is optional, so a global temperature pin would reject every
+    legitimate thinking-off request; the srn hatch resolves the "temperature
+    must be 1 with thinking on" conflict per request instead.
+    """
     return _chat(
         input_usd=input_usd,
         output_usd=output_usd,
@@ -155,6 +182,8 @@ def _anthropic_chat(
         maximum_output_tokens=maximum_output_tokens,
         supports_top_k=not adaptive_reasoning,
         supports_reasoning_effort=adaptive_reasoning,
+        supports_reasoning=supports_reasoning,
+        sampling_requires_reasoning_none=sampling_requires_reasoning_none,
         minimum_temperature=1.0 if adaptive_reasoning else 0.0,
         maximum_temperature=1.0,
         minimum_top_p=0.99 if adaptive_reasoning else 0.0,
@@ -204,6 +233,24 @@ def _embedding(*, input_usd: float, context_window_tokens: int | None = None) ->
 
 
 _OPENAI_MODELS: dict[str, KnownModel] = {
+    # gpt-6-astra (released 2026-09-03): the platform's live probe of 2026-09-04
+    # found reasoning.effort low/medium/high/xhigh/max ('none' and 'minimal'
+    # 400) and temperature/top_p rejected outright; the model page lists
+    # function_calling and structured_outputs among its supported features.
+    # Absence here left every openai gpt-6-astra rung with no strict-tools
+    # verdict (the platform's known-model gate fails closed on an unknown
+    # id), so a strict function tool was refused pre-dispatch on a lane that
+    # honors it (production, 2026-09-15: ~980 refusals a day).
+    "gpt-6-astra": _chat(
+        input_usd=10.0,
+        cached_input_usd=1.0,
+        cache_write_usd=12.5,
+        output_usd=50.0,
+        context_window_tokens=1_050_000,
+        maximum_output_tokens=128_000,
+        supports_temperature=False,
+        supports_reasoning_effort=True,
+    ),
     "gpt-5.6-sol": _chat(
         input_usd=5.0,
         cached_input_usd=0.5,
@@ -241,8 +288,9 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=30.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
-        supports_temperature=False,
+        supports_temperature=True,
         supports_reasoning_effort=True,
+        sampling_requires_reasoning_none=True,
     ),
     "gpt-5.5-pro": _chat(
         input_usd=30.0,
@@ -260,8 +308,9 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=15.0,
         context_window_tokens=1_050_000,
         maximum_output_tokens=128_000,
-        supports_temperature=False,
+        supports_temperature=True,
         supports_reasoning_effort=True,
+        sampling_requires_reasoning_none=True,
     ),
     "gpt-5.4-mini": _chat(
         input_usd=0.75,
@@ -270,8 +319,9 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=4.5,
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
-        supports_temperature=False,
+        supports_temperature=True,
         supports_reasoning_effort=True,
+        sampling_requires_reasoning_none=True,
     ),
     "gpt-5.4-nano": _chat(
         input_usd=0.2,
@@ -280,8 +330,9 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=1.25,
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
-        supports_temperature=False,
+        supports_temperature=True,
         supports_reasoning_effort=True,
+        sampling_requires_reasoning_none=True,
     ),
     "gpt-5.4-pro": _chat(
         input_usd=30.0,
@@ -300,8 +351,9 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=14.0,
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
-        supports_temperature=False,
+        supports_temperature=True,
         supports_reasoning_effort=True,
+        sampling_requires_reasoning_none=True,
     ),
     "gpt-5.2-pro": _chat(
         input_usd=21.0,
@@ -487,6 +539,29 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
 }
 
 _ANTHROPIC_MODELS: dict[str, KnownModel] = {
+    # Verified live 2026-09-01: claude-fable-5-1 keeps claude-fable-5's exact
+    # generation contract (adaptive-only thinking, low..max efforts,
+    # temperature pinned to 1, top_p floor 0.99, top_k rejected; 1M input,
+    # 128k output per the Models API) but discounts cache reads to 0.025x
+    # ($0.25/MTok), so its prices are recorded explicitly, never inherited.
+    "claude-fable-5-1": _anthropic_chat(
+        input_usd=10.0,
+        cached_input_usd=0.25,
+        cache_write_usd=12.5,
+        output_usd=50.0,
+        context_window_tokens=1_000_000,
+        maximum_output_tokens=128_000,
+        adaptive_reasoning=True,
+    ),
+    "claude-mythos-5-1": _anthropic_chat(
+        input_usd=10.0,
+        cached_input_usd=0.25,
+        cache_write_usd=12.5,
+        output_usd=50.0,
+        context_window_tokens=1_000_000,
+        maximum_output_tokens=128_000,
+        adaptive_reasoning=True,
+    ),
     "claude-fable-5": _anthropic_chat(
         input_usd=10.0,
         cached_input_usd=1.0,
@@ -530,6 +605,13 @@ _ANTHROPIC_MODELS: dict[str, KnownModel] = {
         output_usd=5.0,
         context_window_tokens=200_000,
         maximum_output_tokens=64_000,
+        # Budgeted-enabled reasoning: haiku honors a caller thinking config
+        # (budget_tokens), but it is NOT the adaptive/effort-ladder generation,
+        # so its depth is not effort-controlled. srn carries the "temperature
+        # must be 1 with thinking on" conflict per request instead of pinning
+        # sampling for the whole route.
+        supports_reasoning=True,
+        sampling_requires_reasoning_none=True,
     ),
     "claude-opus-4-8": _anthropic_chat(
         input_usd=5.0,
@@ -622,8 +704,47 @@ def canonical_model_id(provider: str, model: str) -> str:
     return _SNAPSHOT_SUFFIX_PATTERN.sub("", identity)
 
 
+_ANTHROPIC_POINT_RELEASE_PATTERN = re.compile(r"^(?P<generation>.+-\d+)-\d+$")
+
+
+def _anthropic_generation_contract(identity: str) -> KnownModel | None:
+    """Inherit generation controls, never prices, for an unrecorded point release.
+
+    The matching rule: an Anthropic id of the form ``<generation>-<minor>``
+    whose ``<generation>`` (itself ending in a digit) is a recorded model
+    inherits that generation's wire contract. Point releases keep their
+    generation's exact controls (claude-fable-5-1 launched with
+    claude-fable-5's thinking, effort, and sampling rules, verified live
+    2026-09-01) but not necessarily its prices (5.1 discounts cache reads
+    4x versus 5), so every price field is cleared: the point release stays
+    servable with the right reasoning contract the day it launches, while
+    priced lanes keep failing closed until its real prices are recorded.
+    ``claude-haiku-4-5`` never falls through here: its would-be generation
+    ``claude-haiku-4`` is not a recorded model.
+    """
+    match = _ANTHROPIC_POINT_RELEASE_PATTERN.match(identity)
+    if match is None:
+        return None
+    generation = _ANTHROPIC_MODELS.get(match.group("generation"))
+    if generation is None:
+        return None
+    return replace(
+        generation,
+        input_cost_per_million_tokens_usd=None,
+        output_cost_per_million_tokens_usd=None,
+        cached_input_cost_per_million_tokens_usd=None,
+        cache_write_cost_per_million_tokens_usd=None,
+    )
+
+
 def known_model_metadata(provider: str, model: str) -> KnownModel | None:
     """Look up verified metadata for one provider model.
+
+    Anthropic point releases resolve through
+    :func:`_anthropic_generation_contract` when no exact record exists, so a
+    newly launched minor version (5.1, 5.2, ...) inherits its generation's
+    wire contract instead of degrading to a non-reasoning route; prices
+    never inherit.
 
     Args:
         provider: Setup provider kind such as ``openai`` or ``anthropic``.
@@ -635,7 +756,11 @@ def known_model_metadata(provider: str, model: str) -> KnownModel | None:
     models = _KNOWN_MODELS.get(provider)
     if models is None:
         return None
-    return models.get(canonical_model_id(provider, model))
+    identity = canonical_model_id(provider, model)
+    known = models.get(identity)
+    if known is None and provider == "anthropic":
+        return _anthropic_generation_contract(identity)
+    return known
 
 
 _RECOMMENDED_MODELS: dict[

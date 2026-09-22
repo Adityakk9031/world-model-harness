@@ -37,6 +37,11 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
 )
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.native_settlement import (
+    tool_search_requests_kwarg,
+    upstream_provider_kwarg,
+    web_search_requests_kwarg,
+)
 from exp.runtime.gateway.sqlite.migrations import connect_database
 
 _logger = logging.getLogger(__name__)
@@ -171,9 +176,13 @@ class GroupCommitAttemptLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
+        reserved_input_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
         fallback_reason: str | None = None,
+        dispatch_reason: str | None = None,
+        preferred_deployment: ExactModelDeployment | None = None,
     ) -> AttemptId:
         """Durably reserve budget and record one dispatch before provider work.
 
@@ -182,9 +191,11 @@ class GroupCommitAttemptLedger:
             deployment: Exact deployment about to receive the request.
             attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
-            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            maximum_cost_nano_usd: Conservative charge reserved before dispatch.
             route_reason: Optional learned-selection reason code.
             fallback_reason: Optional embedding or router fallback reason code.
+            dispatch_reason: Optional policy-dispatch disclosure code.
+            preferred_deployment: The route's bypassed preferred rung, when divergent.
 
         Returns:
             Stable new attempt ID.
@@ -196,9 +207,13 @@ class GroupCommitAttemptLedger:
                 deployment=deployment,
                 attempt_ordinal=attempt_ordinal,
                 route_depth=route_depth,
-                maximum_cost_micro_usd=maximum_cost_micro_usd,
+                maximum_cost_nano_usd=maximum_cost_nano_usd,
+                reserved_input_tokens=reserved_input_tokens,
+                reserved_output_tokens=reserved_output_tokens,
                 route_reason=route_reason,
                 fallback_reason=fallback_reason,
+                dispatch_reason=dispatch_reason,
+                preferred_deployment=preferred_deployment,
             )
         )
 
@@ -210,6 +225,14 @@ class GroupCommitAttemptLedger:
         failure: GatewayFailure | None,
         finalize_request: bool = True,
         first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int = 0,
+        tool_search_requests: int = 0,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -219,15 +242,35 @@ class GroupCommitAttemptLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
+            retry_after_seconds: Provider-stated wait from ``Retry-After``.
+            ratelimit_limit_requests: Provider-stated request-rate ceiling.
+            ratelimit_remaining_requests: Provider-stated requests remaining.
+            ratelimit_limit_tokens: Provider-stated token-rate ceiling.
+            ratelimit_remaining_tokens: Provider-stated tokens remaining.
+            upstream_provider: The upstream an aggregator rung named as serving.
+            web_search_requests: Gateway-executed web searches billed to the attempt.
+            tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
         """
+        # The host's apply hook is the object this facade forwards to, so it is
+        # the one probed for the settle keywords; a hook that predates one gets
+        # none. Its signature is what is probed, so it is not trusted statically.
+        apply = cast("Callable[..., None]", self.core.apply_finish_attempt)
         await self._submit(
-            lambda connection: self.core.apply_finish_attempt(
+            lambda connection: apply(
                 connection,
                 attempt_id=attempt_id,
                 terminal_event=terminal_event,
                 failure=failure,
                 finalize_request=finalize_request,
                 first_token_at=first_token_at,
+                retry_after_seconds=retry_after_seconds,
+                ratelimit_limit_requests=ratelimit_limit_requests,
+                ratelimit_remaining_requests=ratelimit_remaining_requests,
+                ratelimit_limit_tokens=ratelimit_limit_tokens,
+                ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+                **upstream_provider_kwarg(apply, upstream_provider),
+                **web_search_requests_kwarg(apply, web_search_requests),
+                **tool_search_requests_kwarg(apply, tool_search_requests),
             )
         )
 
@@ -489,9 +532,13 @@ class SyncGroupCommitLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
+        reserved_input_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
         fallback_reason: str | None = None,
+        dispatch_reason: str | None = None,
+        preferred_deployment: ExactModelDeployment | None = None,
     ) -> AttemptId:
         """Durably reserve budget and record one dispatch before provider work.
 
@@ -500,9 +547,11 @@ class SyncGroupCommitLedger:
             deployment: Exact deployment about to receive the request.
             attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
-            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            maximum_cost_nano_usd: Conservative charge reserved before dispatch.
             route_reason: Optional learned-selection reason code.
             fallback_reason: Optional embedding or router fallback reason code.
+            dispatch_reason: Optional policy-dispatch disclosure code.
+            preferred_deployment: The route's bypassed preferred rung, when divergent.
 
         Returns:
             Stable new attempt ID.
@@ -514,9 +563,13 @@ class SyncGroupCommitLedger:
                 deployment=deployment,
                 attempt_ordinal=attempt_ordinal,
                 route_depth=route_depth,
-                maximum_cost_micro_usd=maximum_cost_micro_usd,
+                maximum_cost_nano_usd=maximum_cost_nano_usd,
+                reserved_input_tokens=reserved_input_tokens,
+                reserved_output_tokens=reserved_output_tokens,
                 route_reason=route_reason,
                 fallback_reason=fallback_reason,
+                dispatch_reason=dispatch_reason,
+                preferred_deployment=preferred_deployment,
             )
         )
 
@@ -528,6 +581,14 @@ class SyncGroupCommitLedger:
         failure: GatewayFailure | None,
         finalize_request: bool = True,
         first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int = 0,
+        tool_search_requests: int = 0,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -537,15 +598,33 @@ class SyncGroupCommitLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
+            retry_after_seconds: Provider-stated wait from ``Retry-After``.
+            ratelimit_limit_requests: Provider-stated request-rate ceiling.
+            ratelimit_remaining_requests: Provider-stated requests remaining.
+            ratelimit_limit_tokens: Provider-stated token-rate ceiling.
+            ratelimit_remaining_tokens: Provider-stated tokens remaining.
+            upstream_provider: The upstream an aggregator rung named as serving.
+            web_search_requests: Gateway-executed web searches billed to the attempt.
+            tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
         """
+        # Same probe as the async facade: the host hook decides the keywords.
+        apply = cast("Callable[..., None]", self._writer.core.apply_finish_attempt)
         self._writer.submit_blocking(
-            lambda connection: self._writer.core.apply_finish_attempt(
+            lambda connection: apply(
                 connection,
                 attempt_id=attempt_id,
                 terminal_event=terminal_event,
                 failure=failure,
                 finalize_request=finalize_request,
                 first_token_at=first_token_at,
+                retry_after_seconds=retry_after_seconds,
+                ratelimit_limit_requests=ratelimit_limit_requests,
+                ratelimit_remaining_requests=ratelimit_remaining_requests,
+                ratelimit_limit_tokens=ratelimit_limit_tokens,
+                ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+                **upstream_provider_kwarg(apply, upstream_provider),
+                **web_search_requests_kwarg(apply, web_search_requests),
+                **tool_search_requests_kwarg(apply, tool_search_requests),
             )
         )
 

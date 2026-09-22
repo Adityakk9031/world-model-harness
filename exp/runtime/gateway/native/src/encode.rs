@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 
 use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
+use crate::tool_search::annotate_tool_search_usage_details;
+use crate::web_search::{annotate_usage_details, ChatWebSearch, WebSearchAdmission};
 
 /// Derive one replay-stable public object ID, mirroring `stable_public_id`.
 pub fn stable_public_id(prefix: &str, request_id: &str) -> String {
@@ -37,8 +39,10 @@ pub struct ReasoningCarrierToolCall {
     pub raw_arguments: String,
 }
 
+/// Shared by the Chat and Messages encoders: both surfaces retain the same
+/// hidden-reasoning candidate and seal it under the same authority.
 #[derive(Default)]
-struct ReasoningCarrierState {
+pub(crate) struct ReasoningCarrierState {
     route_sha256: Option<String>,
     content: String,
     assistant_content: String,
@@ -48,7 +52,7 @@ struct ReasoningCarrierState {
 }
 
 impl ReasoningCarrierState {
-    fn observe(&mut self, event: &Event) -> Result<(), PublicError> {
+    pub(crate) fn observe(&mut self, event: &Event) -> Result<(), PublicError> {
         match event {
             Event::TextDelta(delta) => self.assistant_content.push_str(delta),
             Event::ReasoningContentDelta {
@@ -77,6 +81,7 @@ impl ReasoningCarrierState {
                 index,
                 call_id,
                 name,
+                ..
             } => {
                 if self.tool_ids.contains_key(index)
                     || self
@@ -117,7 +122,7 @@ impl ReasoningCarrierState {
         Ok(())
     }
 
-    fn candidate(&self) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
+    pub(crate) fn candidate(&self) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
         if self.content.is_empty() || self.tool_ids.is_empty() {
             return Ok(None);
         }
@@ -177,6 +182,11 @@ pub struct ChatSseEncoder {
     usage: Option<Usage>,
     reasoning: ReasoningCarrierState,
     reasoning_content_carrier: Option<String>,
+    reasoning_output_exposed: bool,
+    web_search: Option<ChatWebSearch>,
+    /// Gateway-run tool-search rounds metered on the usage chunk; zero
+    /// leaves every frame byte-identical.
+    tool_search_requests: u32,
 }
 
 impl ChatSseEncoder {
@@ -201,12 +211,38 @@ impl ChatSseEncoder {
             usage: None,
             reasoning: ReasoningCarrierState::default(),
             reasoning_content_carrier: None,
+            reasoning_output_exposed: false,
+            web_search: None,
+            tool_search_requests: 0,
         }
+    }
+
+    /// Meter the gateway-run tool-search rounds on the usage chunk; the Chat
+    /// surface renders no item for them.
+    pub fn set_tool_search_requests(&mut self, requests: u32) {
+        self.tool_search_requests = requests;
     }
 
     /// Attach an authenticated carrier before the terminal is encoded.
     pub fn set_reasoning_content_carrier(&mut self, carrier: String) {
         self.reasoning_content_carrier = Some(carrier);
+    }
+
+    /// Cite the gateway-executed web search at the terminal: `None` (no
+    /// search) leaves every frame byte-identical.
+    pub fn set_web_search(&mut self, web_search: Option<WebSearchAdmission>) {
+        self.web_search = web_search.map(ChatWebSearch::new);
+    }
+
+    /// Expose the model's plaintext reasoning to the caller on output.
+    ///
+    /// Off by default so hidden-reasoning providers (OpenAI o-series, which
+    /// carry no plaintext reasoning event at all) never leak. Turned on only for
+    /// rungs the catalog marks `reasoning_output_exposed`, so a Tencent/DeepSeek
+    /// client sees the `reasoning_content` deltas it is already billed for. The
+    /// sealed round-trip carrier at the terminal is independent of this.
+    pub fn set_reasoning_output_exposed(&mut self, exposed: bool) {
+        self.reasoning_output_exposed = exposed;
     }
 
     /// Return the validated candidate accumulated by a live stream.
@@ -240,6 +276,9 @@ impl ChatSseEncoder {
             ));
         }
         self.reasoning.observe(event)?;
+        if let Some(web_search) = self.web_search.as_mut() {
+            web_search.observe(event);
+        }
         match event {
             Event::TextDelta(text) => Ok(vec![self.chunk(json!({"content": text}), None)]),
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
@@ -249,9 +288,21 @@ impl ChatSseEncoder {
             Event::ProviderRefusalDelta { delta, .. } => {
                 Ok(vec![self.chunk(json!({"refusal": delta}), None)])
             }
-            Event::ReasoningContentDelta { .. } => Ok(Vec::new()),
-            // The Chat wire has no reasoning representation, so provider
-            // reasoning follows the summary path and is deliberately dropped.
+            Event::ReasoningContentDelta { delta, .. } => {
+                // On an exposure-gated rung (Tencent/DeepSeek), the model's
+                // plaintext reasoning is returned to the caller as
+                // `choices[].delta.reasoning_content` — the tokens are already
+                // billed. Elsewhere it stays dropped (the Chat wire has no
+                // reasoning field by default); the sealed round-trip carrier at
+                // the terminal is emitted independently regardless.
+                if self.reasoning_output_exposed && !delta.is_empty() {
+                    Ok(vec![self.chunk(json!({"reasoning_content": delta}), None)])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            // The Chat wire has no reasoning representation, so provider summary
+            // and opaque reasoning follow the summary path and are dropped.
             Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
@@ -259,10 +310,32 @@ impl ChatSseEncoder {
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }
             | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
+            // Anthropic text-block boundaries and citation metadata have no
+            // Chat representation; the text itself streams through TextDelta.
+            Event::TextBlockStarted { .. } | Event::CitationDelta { .. } => Ok(Vec::new()),
+            // Server tools enter only through a Messages request, which
+            // never encodes on the Chat surface.
+            Event::ServerToolUseStarted { .. }
+            | Event::ServerToolArgumentsDelta { .. }
+            | Event::ServerToolUseCompleted { .. }
+            | Event::ServerToolResult { .. } => Err(invalid_provider_stream(
+                "Chat cannot represent a provider server tool.",
+            )),
+            // Hosted tool items enter only through Responses-native tool
+            // declarations, which never admit on the Chat surface.
+            Event::HostedToolItemStarted { .. }
+            | Event::HostedToolItemProgress { .. }
+            | Event::HostedToolItemCompleted { .. } => Err(invalid_provider_stream(
+                "Chat cannot represent a provider-hosted Responses tool item.",
+            )),
+            // OpenAI text annotations have no Chat representation; the text
+            // itself streams through its delta events.
+            Event::ProviderTextAnnotation { .. } => Ok(Vec::new()),
             Event::ToolCallStarted {
                 index,
                 call_id,
                 name,
+                ..
             } => {
                 if self.tool_indices.contains_key(index) {
                     return Err(invalid_provider_stream(
@@ -330,7 +403,10 @@ impl ChatSseEncoder {
                 }
                 Ok(Vec::new())
             }
-            Event::Completed | Event::Incomplete => {
+            Event::Completed
+            | Event::Incomplete
+            | Event::StoppedAtSequence(_)
+            | Event::PausedTurn => {
                 self.terminal = true;
                 let finish_reason = if matches!(event, Event::Incomplete) {
                     "length"
@@ -340,13 +416,21 @@ impl ChatSseEncoder {
                     "stop"
                 };
                 let mut frames = Vec::new();
-                if matches!(event, Event::Completed) && self.reasoning.candidate()?.is_some() {
+                if matches!(event, Event::Completed | Event::StoppedAtSequence(_))
+                    && self.reasoning.candidate()?.is_some()
+                {
                     let carrier = self.reasoning_content_carrier.as_ref().ok_or_else(|| {
                         invalid_provider_stream(
                             "Chat reasoning content was not sealed by the gateway authority.",
                         )
                     })?;
                     frames.push(self.chunk(json!({"reasoning_content": carrier}), None));
+                }
+                // Search citations ride one annotations delta immediately
+                // before the finish chunk, and only when a result URL appears.
+                let annotations = self.web_search.as_ref().map(ChatWebSearch::annotations);
+                if let Some(annotations) = annotations.filter(|found| !found.is_empty()) {
+                    frames.push(self.chunk(json!({"annotations": annotations}), None));
                 }
                 frames.push(self.chunk(json!({}), Some(finish_reason)));
                 if self.include_usage {
@@ -399,13 +483,19 @@ impl ChatSseEncoder {
     }
 
     fn usage_chunk(&self, usage: &Usage) -> String {
+        let mut usage = streaming_chat_usage(usage);
+        annotate_usage_details(
+            &mut usage,
+            self.web_search.as_ref().map(ChatWebSearch::admission),
+        );
+        annotate_tool_search_usage_details(&mut usage, self.tool_search_requests);
         let payload = json!({
             "id": self.completion_id,
             "object": "chat.completion.chunk",
             "created": self.created_at,
             "model": self.model,
             "choices": [],
-            "usage": streaming_chat_usage(usage),
+            "usage": usage,
         });
         chat_data(&payload)
     }
@@ -430,9 +520,25 @@ fn streaming_chat_usage(usage: &Usage) -> Value {
         "prompt_tokens": input,
         "completion_tokens": output,
         "total_tokens": input + output,
-        "prompt_tokens_details": {"cached_tokens": usage.cached_input_tokens.unwrap_or(0)},
+        "prompt_tokens_details": chat_input_details(usage, true),
         "completion_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
     })
+}
+
+/// Input subsets remain unknown when absent; cache writes are never invented.
+fn chat_input_details(usage: &Usage, streaming: bool) -> Value {
+    let mut details = serde_json::Map::new();
+    if let Some(cached) = usage.cached_input_tokens.or(streaming.then_some(0)) {
+        details.insert("cached_tokens".into(), json!(cached));
+    }
+    if let Some(written) = usage.cache_creation_input_tokens {
+        details.insert("cache_write_tokens".into(), json!(written));
+    }
+    if details.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(details)
+    }
 }
 
 /// Non-streaming usage shape from `exp.runtime.openai_protocol.response.chat_usage`.
@@ -443,10 +549,7 @@ fn completed_chat_usage(usage: Option<&Usage>) -> Value {
     };
     let input = usage.input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
-    let details = match usage.cached_input_tokens {
-        Some(cached) => json!({"cached_tokens": cached}),
-        None => Value::Null,
-    };
+    let details = chat_input_details(usage, false);
     let output_details = match usage.reasoning_tokens {
         Some(reasoning) => json!({"reasoning_tokens": reasoning}),
         None => Value::Null,
@@ -476,6 +579,7 @@ pub fn completed_chat_body_with_ignored(
     created_at: i64,
     events: &[Event],
     ignored_parameters: &[String],
+    reasoning_output_exposed: bool,
 ) -> Result<AggregatedCompletion, PublicError> {
     completed_chat_body_with_carrier(
         request_id,
@@ -484,6 +588,7 @@ pub fn completed_chat_body_with_ignored(
         events,
         ignored_parameters,
         None,
+        reasoning_output_exposed,
     )
 }
 
@@ -495,6 +600,7 @@ pub fn completed_chat_body_with_carrier(
     events: &[Event],
     ignored_parameters: &[String],
     reasoning_content_carrier: Option<&str>,
+    reasoning_output_exposed: bool,
 ) -> Result<AggregatedCompletion, PublicError> {
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
@@ -577,9 +683,25 @@ pub fn completed_chat_body_with_carrier(
         "role": "assistant",
         "content": if text.is_empty() { Value::Null } else { Value::String(text) },
         "refusal": if refusal.is_empty() { Value::Null } else { Value::String(refusal) },
-        "tool_calls": if tool_calls.is_empty() { Value::Null } else { Value::Array(tool_calls) },
     });
-    if matches!(terminal, Event::Completed) && has_tool_calls && reasoning.is_some() {
+    // OpenAI documents `tool_calls` as an optional array and omits it from a
+    // message that made no calls; it never serializes `null` there. Strict
+    // OpenAI-schema consumers (the OpenRouter SDK's response parser, for one)
+    // reject `"tool_calls": null` while accepting an absent key, so the key
+    // appears only when there is at least one call.
+    if has_tool_calls {
+        message
+            .as_object_mut()
+            .expect("chat message is an object")
+            .insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    if matches!(terminal, Event::Completed | Event::StoppedAtSequence(_))
+        && has_tool_calls
+        && reasoning.is_some()
+    {
+        // A tool turn's reasoning round-trips as the sealed opaque carrier
+        // (never raw plaintext — that would be a CoT-injection vector on the
+        // way back in), so `reasoning_content` carries the carrier.
         let carrier = reasoning_content_carrier.ok_or_else(|| {
             invalid_provider_stream(
                 "Chat reasoning content was not sealed by the gateway authority.",
@@ -592,6 +714,27 @@ pub fn completed_chat_body_with_carrier(
                 "reasoning_content".to_string(),
                 Value::String(carrier.to_string()),
             );
+    } else if reasoning_output_exposed {
+        // A non-tool reasoning turn on an exposure-gated rung
+        // (Tencent/DeepSeek) has no carrier to round-trip, so the plaintext
+        // reasoning is returned for display only. The tokens are already
+        // billed; every other rung keeps reasoning stripped.
+        let reasoning_text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ReasoningContentDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !reasoning_text.is_empty() {
+            message
+                .as_object_mut()
+                .expect("chat message is an object")
+                .insert(
+                    "reasoning_content".to_string(),
+                    Value::String(reasoning_text),
+                );
+        }
     }
     let mut body = json!({
         "id": stable_public_id("chatcmpl", request_id),
@@ -626,175 +769,5 @@ pub fn completed_chat_body_with_carrier(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fireworks_tool_events() -> Vec<Event> {
-        vec![
-            Event::ReasoningContentDelta {
-                route_sha256: "a".repeat(64),
-                delta: "hidden provider reasoning".to_string(),
-            },
-            Event::ToolCallStarted {
-                index: 0,
-                call_id: "call-one".to_string(),
-                name: "lookup".to_string(),
-            },
-            Event::ToolArgumentsDelta {
-                index: 0,
-                delta: "{}".to_string(),
-            },
-            Event::ToolCallCompleted {
-                index: 0,
-                call: crate::events::CompletedToolCall {
-                    call_id: "call-one".to_string(),
-                    name: "lookup".to_string(),
-                    raw_arguments: "{}".to_string(),
-                    provider_item_id: None,
-                    provider_status: None,
-                    custom: false,
-                },
-            },
-            Event::Completed,
-        ]
-    }
-
-    #[test]
-    fn fireworks_chat_reasoning_round_trips_only_as_sealed_carrier() {
-        let events = fireworks_tool_events();
-        let mut stream = ChatSseEncoder::new_with_ignored(
-            "request-1",
-            "coding",
-            1_700_000_000,
-            false,
-            Vec::new(),
-        );
-        stream.set_reasoning_content_carrier("authenticated-carrier-v2".to_string());
-        let mut frames = stream.start().expect("stream start must encode");
-        for event in &events {
-            frames.extend(stream.feed(event).expect("event must encode"));
-        }
-        let public = frames.join("");
-        assert!(!public.contains("hidden provider reasoning"));
-        assert!(public.contains("authenticated-carrier-v2"));
-
-        let completed = completed_chat_body_with_carrier(
-            "request-1",
-            "coding",
-            1_700_000_000,
-            &events,
-            &[],
-            Some("authenticated-carrier-v2"),
-        )
-        .expect("completed body must preserve the carrier");
-        assert_eq!(
-            completed.body["choices"][0]["message"]["reasoning_content"],
-            json!("authenticated-carrier-v2")
-        );
-        assert!(!completed
-            .body
-            .to_string()
-            .contains("hidden provider reasoning"));
-    }
-
-    #[test]
-    fn fireworks_chat_reasoning_fails_closed_without_carrier_or_unique_completion() {
-        let events = fireworks_tool_events();
-        assert!(completed_chat_body_with_ignored(
-            "request-1",
-            "coding",
-            1_700_000_000,
-            &events,
-            &[],
-        )
-        .is_err());
-
-        let mut duplicate = events[..events.len() - 1].to_vec();
-        duplicate.push(events[3].clone());
-        duplicate.push(Event::Completed);
-        assert!(reasoning_carrier_candidate(&duplicate).is_err());
-    }
-
-    #[test]
-    fn reasoning_carrier_preserves_provider_tool_start_order() {
-        let events = vec![
-            Event::ReasoningContentDelta {
-                route_sha256: "a".repeat(64),
-                delta: "hidden".to_string(),
-            },
-            Event::ToolCallStarted {
-                index: 1,
-                call_id: "call-one".to_string(),
-                name: "first".to_string(),
-            },
-            Event::ToolCallStarted {
-                index: 0,
-                call_id: "call-zero".to_string(),
-                name: "second".to_string(),
-            },
-            Event::ToolCallCompleted {
-                index: 0,
-                call: crate::events::CompletedToolCall {
-                    call_id: "call-zero".to_string(),
-                    name: "second".to_string(),
-                    raw_arguments: "{\"order\":0}".to_string(),
-                    provider_item_id: None,
-                    provider_status: None,
-                    custom: false,
-                },
-            },
-            Event::ToolCallCompleted {
-                index: 1,
-                call: crate::events::CompletedToolCall {
-                    call_id: "call-one".to_string(),
-                    name: "first".to_string(),
-                    raw_arguments: "{\"order\":1}".to_string(),
-                    provider_item_id: None,
-                    provider_status: None,
-                    custom: false,
-                },
-            },
-        ];
-
-        let candidate = reasoning_carrier_candidate(&events)
-            .expect("provider events must validate")
-            .expect("reasoning plus tools must produce a carrier");
-
-        assert_eq!(
-            candidate
-                .tool_calls
-                .iter()
-                .map(|call| call.call_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["call-one", "call-zero"]
-        );
-    }
-
-    #[test]
-    fn ignored_generation_controls_are_disclosed_by_both_chat_encoders() {
-        let ignored = vec!["top_p".to_string(), "reasoning_effort".to_string()];
-        let mut stream = ChatSseEncoder::new_with_ignored(
-            "request-1",
-            "coding",
-            1_700_000_000,
-            false,
-            ignored.clone(),
-        );
-        let frames = stream.start().expect("stream start must encode");
-        assert!(frames[0]
-            .contains("\"x-experiential-ignored-parameters\":[\"top_p\",\"reasoning_effort\"]"));
-
-        let completed = completed_chat_body_with_ignored(
-            "request-1",
-            "coding",
-            1_700_000_000,
-            &[Event::Completed],
-            &ignored,
-        )
-        .expect("completed body must encode");
-        assert_eq!(
-            completed.body["x-experiential-ignored-parameters"],
-            json!(["top_p", "reasoning_effort"])
-        );
-    }
-}
+#[path = "encode_tests.rs"]
+mod tests;

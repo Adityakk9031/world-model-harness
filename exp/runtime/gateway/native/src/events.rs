@@ -1,7 +1,36 @@
 //! Provider-neutral stream events, the Rust mirror of `GatewayEvent`.
+//!
+//! # Usage contract
+//!
+//! Every usage mapper in this module emits OpenAI subset semantics:
+//! `reasoning_tokens` (when known) counts a SUBSET of `output_tokens`, and
+//! `cached_input_tokens` a subset of `input_tokens`. Settlement prices the
+//! reasoning subset at the reasoning rate and the remainder of `output_tokens`
+//! at the output rate, so a wire that reports reasoning OUTSIDE its output
+//! total would bill every reasoning token at zero unless the mapper folds it
+//! back in. Per wire:
+//!
+//! - OpenAI-shaped wires (Responses via `openai_usage`, Chat Completions via
+//!   `openai_compatible_usage`): OpenAI, OpenRouter, DeepSeek, and Fireworks
+//!   report reasoning inside the output total; xAI (native and relayed by
+//!   Azure Foundry) reports it outside on both wires. The provider's own
+//!   `total_tokens` decides: `input + output` is the subset shape and is
+//!   forwarded as reported, `input + output + reasoning` is the additive shape
+//!   and folds (`fold_openai_shaped_reasoning`). Without a decisive total, a
+//!   reasoning count above the output total is impossible under subset
+//!   semantics and folds.
+//! - Gemini (`gemini_usage`): `thoughtsTokenCount` is additive by Google's
+//!   definition (`totalTokenCount` = prompt + candidates + thoughts), so it is
+//!   folded into `output_tokens` unconditionally.
+//! - Anthropic Messages and Bedrock Converse: thinking is billed inside the
+//!   provider's `output_tokens` and no separate count is published, so
+//!   `reasoning_tokens` stays `None` and the total is forwarded as reported.
+//!
+//! A fold whose total leaves the persistable ledger range is a provider
+//! contract violation and fails the stream; totals are never clamped.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::errors::Failure;
 
@@ -11,6 +40,14 @@ pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
+    /// Cache-write tokens inside the input total, present only when the
+    /// provider reported a nonzero count. Cache reads and writes are
+    /// disjoint subsets of input and have separately configured prices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    /// Observed one-hour subset; absent when no complete TTL breakdown exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
 }
 
@@ -25,6 +62,15 @@ impl Usage {
 pub struct CompletedToolCall {
     pub call_id: String,
     pub name: String,
+    /// Nested tool tree (Responses `namespace`) that declared this call,
+    /// preserved verbatim through retention and the client stream because
+    /// the provider rejects a namespaced call replayed without it.
+    pub namespace: Option<String>,
+    /// Opaque SDK 3.0 `caller` attribution (for example
+    /// `{"type": "program", "id": ...}`) naming the program that invoked
+    /// this call; carried verbatim like `namespace` so the item
+    /// round-trips exactly as the provider emitted it.
+    pub caller: Option<Value>,
     pub provider_item_id: Option<String>,
     pub provider_status: Option<ProviderOutputItemStatus>,
     /// Raw provider-order argument text: a validated JSON object for
@@ -162,9 +208,18 @@ pub enum Event {
         delta: String,
     },
     ToolCallStarted {
+        /// Whether the public call carries freeform custom input.
+        custom: bool,
         index: u32,
         call_id: String,
         name: String,
+        /// Nested tool tree (Responses `namespace`) that declared this call;
+        /// present only on native Responses streams and preserved verbatim
+        /// because the provider rejects a namespaced call replayed without it.
+        namespace: Option<String>,
+        /// Opaque SDK 3.0 `caller` attribution carried verbatim like
+        /// `namespace`.
+        caller: Option<Value>,
     },
     ToolArgumentsDelta {
         index: u32,
@@ -174,9 +229,96 @@ pub enum Event {
         index: u32,
         call: CompletedToolCall,
     },
+    /// One provider-executed Anthropic server tool invocation opening
+    /// (`server_tool_use`); the provider runs the tool itself, so these
+    /// never become client tool calls or affect the tool-use stop reason.
+    ServerToolUseStarted {
+        index: u32,
+        call_id: String,
+        name: String,
+    },
+    /// Raw provider-order input fragment for one open server tool use.
+    ServerToolArgumentsDelta {
+        index: u32,
+        delta: String,
+    },
+    /// One completed server tool invocation with its validated input text.
+    ServerToolUseCompleted {
+        index: u32,
+        call: CompletedToolCall,
+    },
+    /// One whole verbatim Anthropic server-tool result content block
+    /// (`web_search_tool_result`), carried as compact JSON text: the result
+    /// arrives complete in its start frame and must reach the caller intact.
+    ServerToolResult {
+        index: u32,
+        block: String,
+    },
+    /// One OpenAI Responses hosted-tool output item opening
+    /// (`web_search_call`, `mcp_call`, `code_interpreter_call`, ...). The
+    /// provider executes the tool itself and owns the item's shape, so the
+    /// whole item is carried verbatim as compact JSON: the caller (and its
+    /// next-turn echo) must see exactly what the provider produced.
+    HostedToolItemStarted {
+        output_index: u32,
+        item_id: String,
+        item_type: String,
+        item: String,
+    },
+    /// One verbatim per-type lifecycle or delta frame for an open hosted
+    /// tool item (`response.web_search_call.searching`,
+    /// `response.mcp_call_arguments.delta`, ...), carried as compact JSON.
+    /// The Responses encoder re-stamps only the public output index and
+    /// sequence number; every other payload field passes through untouched.
+    HostedToolItemProgress {
+        output_index: u32,
+        item_id: String,
+        event_type: String,
+        payload: String,
+    },
+    /// One completed hosted tool item with its final verbatim JSON, from the
+    /// provider's `response.output_item.done` (or the last-seen item when the
+    /// terminal response arrived first).
+    HostedToolItemCompleted {
+        output_index: u32,
+        item_id: String,
+        item_type: String,
+        item: String,
+    },
+    /// One whole verbatim OpenAI Responses output-text annotation
+    /// (`response.output_text.annotation.added`: URL citations from hosted
+    /// web search), carried as compact JSON and attached to the open
+    /// provider-owned assistant message item.
+    ProviderTextAnnotation {
+        output_index: u32,
+        item_id: String,
+        annotation: String,
+    },
+    /// Provider text content-block boundary on the Anthropic wire. Emitted
+    /// before that block's first text delta so the Messages encoder can
+    /// mirror the provider's block structure (citations attach per block);
+    /// encoders without a block concept ignore it.
+    TextBlockStarted {
+        index: u32,
+    },
+    /// One whole verbatim citation object attached to the open Anthropic
+    /// text block (`citations_delta`), carried as compact JSON text.
+    CitationDelta {
+        index: u32,
+        citation: String,
+    },
     Usage(Usage),
     Completed,
     Incomplete,
+    /// The gateway cut the stream at one of the caller's stop sequences on a
+    /// wire that has no stop field (OpenAI Responses). Settles as completed;
+    /// the Messages encoder reports `stop_sequence` with this exact value.
+    StoppedAtSequence(String),
+    /// Anthropic `pause_turn` terminal: the provider paused a long-running
+    /// server-tool turn and expects the caller to resend the conversation to
+    /// continue it. Settlement treats it like a completed turn; the Messages
+    /// encoder must preserve the stop reason or the caller never resumes.
+    PausedTurn,
     Failed(Failure),
 }
 
@@ -184,8 +326,36 @@ impl Event {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Event::Completed | Event::Incomplete | Event::Failed(_)
+            Event::Completed
+                | Event::Incomplete
+                | Event::StoppedAtSequence(_)
+                | Event::PausedTurn
+                | Event::Failed(_)
         )
+    }
+
+    /// Whether this event advances generation rather than keeping transport
+    /// alive. Private reasoning is progress even when its text stays hidden.
+    /// Item-open scaffolding, empty deltas and usage alone do not renew idle.
+    pub fn is_generation_progress(&self) -> bool {
+        if self.is_output_token() {
+            return true;
+        }
+        match self {
+            Event::ThinkingSignature { signature, .. } => !signature.is_empty(),
+            Event::RedactedThinking { data, .. } => !data.is_empty(),
+            Event::EncryptedReasoning {
+                encrypted_content, ..
+            } => !encrypted_content.is_empty(),
+            Event::ToolCallCompleted { .. }
+            | Event::ServerToolUseCompleted { .. }
+            | Event::ServerToolResult { .. }
+            | Event::HostedToolItemProgress { .. }
+            | Event::HostedToolItemCompleted { .. }
+            | Event::CitationDelta { .. }
+            | Event::ProviderTextAnnotation { .. } => true,
+            _ => false,
+        }
     }
 
     /// Whether this event carries the first visible model output, used to
@@ -208,8 +378,13 @@ impl Event {
             | Event::ReasoningSummaryDelta { delta, .. }
             | Event::ThinkingDelta { delta, .. }
             | Event::ReasoningContentDelta { delta, .. }
-            | Event::ToolArgumentsDelta { delta, .. } => !delta.is_empty(),
-            Event::ToolCallStarted { .. } => true,
+            | Event::ToolArgumentsDelta { delta, .. }
+            | Event::ServerToolArgumentsDelta { delta, .. } => !delta.is_empty(),
+            Event::ToolCallStarted { .. }
+            | Event::ServerToolUseStarted { .. }
+            // A hosted tool item start is the provider beginning visible
+            // work, the same first-token signal as a tool-call start.
+            | Event::HostedToolItemStarted { .. } => true,
             _ => false,
         }
     }
@@ -328,15 +503,30 @@ pub fn simplified_event(event: &Event) -> Value {
             "text": delta,
         }),
         Event::ToolCallStarted {
+            custom,
             index,
             call_id,
             name,
-        } => serde_json::json!({
-            "kind": "tool_call_started",
-            "index": index,
-            "call_id": call_id,
-            "name": name,
-        }),
+            namespace,
+            caller,
+        } => {
+            let mut payload = serde_json::json!({
+                "kind": "tool_call_started",
+                "index": index,
+                "call_id": call_id,
+                "name": name,
+            });
+            if *custom {
+                payload["custom"] = Value::Bool(true);
+            }
+            if let Some(namespace) = namespace {
+                payload["namespace"] = Value::String(namespace.clone());
+            }
+            if let Some(caller) = caller {
+                payload["caller"] = caller.clone();
+            }
+            payload
+        }
         Event::ToolArgumentsDelta { index, delta } => serde_json::json!({
             "kind": "tool_arguments_delta",
             "index": index,
@@ -350,6 +540,12 @@ pub fn simplified_event(event: &Event) -> Value {
                 "name": call.name,
                 "raw_arguments": call.raw_arguments,
             });
+            if let Some(namespace) = &call.namespace {
+                payload["namespace"] = Value::String(namespace.clone());
+            }
+            if let Some(caller) = &call.caller {
+                payload["caller"] = caller.clone();
+            }
             if let Some(item_id) = &call.provider_item_id {
                 payload["item_id"] = Value::String(item_id.clone());
             }
@@ -358,20 +554,120 @@ pub fn simplified_event(event: &Event) -> Value {
             }
             payload
         }
-        Event::Usage(usage) => serde_json::json!({
-            "kind": "usage",
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cached_input_tokens": usage.cached_input_tokens,
-            "reasoning_tokens": usage.reasoning_tokens,
+        Event::ServerToolUseStarted {
+            index,
+            call_id,
+            name,
+        } => serde_json::json!({
+            "kind": "server_tool_use_started",
+            "index": index,
+            "call_id": call_id,
+            "name": name,
         }),
-        Event::Completed => serde_json::json!({"kind": "completed"}),
+        Event::ServerToolArgumentsDelta { index, delta } => serde_json::json!({
+            "kind": "server_tool_arguments_delta",
+            "index": index,
+            "text": delta,
+        }),
+        Event::ServerToolUseCompleted { index, call } => serde_json::json!({
+            "kind": "server_tool_use_completed",
+            "index": index,
+            "call_id": call.call_id,
+            "name": call.name,
+            "raw_arguments": call.raw_arguments,
+        }),
+        Event::ServerToolResult { index, block } => serde_json::json!({
+            "kind": "server_tool_result",
+            "index": index,
+            "block": block,
+        }),
+        Event::HostedToolItemStarted {
+            output_index,
+            item_id,
+            item_type,
+            item,
+        } => serde_json::json!({
+            "kind": "hosted_tool_item_started",
+            "output_index": output_index,
+            "item_id": item_id,
+            "item_type": item_type,
+            "item": item,
+        }),
+        Event::HostedToolItemProgress {
+            output_index,
+            item_id,
+            event_type,
+            payload,
+        } => serde_json::json!({
+            "kind": "hosted_tool_item_progress",
+            "output_index": output_index,
+            "item_id": item_id,
+            "event_type": event_type,
+            "payload": payload,
+        }),
+        Event::HostedToolItemCompleted {
+            output_index,
+            item_id,
+            item_type,
+            item,
+        } => serde_json::json!({
+            "kind": "hosted_tool_item_completed",
+            "output_index": output_index,
+            "item_id": item_id,
+            "item_type": item_type,
+            "item": item,
+        }),
+        Event::ProviderTextAnnotation {
+            output_index,
+            item_id,
+            annotation,
+        } => serde_json::json!({
+            "kind": "provider_text_annotation",
+            "output_index": output_index,
+            "item_id": item_id,
+            "annotation": annotation,
+        }),
+        Event::TextBlockStarted { index } => serde_json::json!({
+            "kind": "text_block_started",
+            "index": index,
+        }),
+        Event::CitationDelta { index, citation } => serde_json::json!({
+            "kind": "citation_delta",
+            "index": index,
+            "citation": citation,
+        }),
+        Event::Usage(usage) => {
+            let mut payload = serde_json::json!({
+                "kind": "usage",
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cached_input_tokens": usage.cached_input_tokens,
+                "reasoning_tokens": usage.reasoning_tokens,
+            });
+            if let Some(creation) = usage.cache_creation_input_tokens {
+                payload["cache_creation_input_tokens"] = serde_json::json!(creation);
+            }
+            if let Some(hour) = usage.cache_creation_1h_input_tokens {
+                payload["cache_creation_1h_input_tokens"] = serde_json::json!(hour);
+            }
+            payload
+        }
+        // A stop-sequence cut is a completed turn to every python consumer
+        // (guardrails, retention); only the public encoders name the sequence.
+        Event::Completed | Event::StoppedAtSequence(_) => serde_json::json!({"kind": "completed"}),
         Event::Incomplete => serde_json::json!({"kind": "incomplete"}),
-        Event::Failed(failure) => serde_json::json!({
-            "kind": "failed",
-            "failure_class": failure.failure_class.as_str(),
-            "safe_message": failure.safe_message,
-        }),
+        Event::PausedTurn => serde_json::json!({"kind": "paused_turn"}),
+        Event::Failed(failure) => {
+            let mut value = serde_json::json!({
+                "kind": "failed",
+                "failure_class": failure.failure_class.as_str(),
+                "safe_message": failure.safe_message,
+            });
+            if let Some(reason) = failure.refusal_reason {
+                value["refusal_reason"] = serde_json::json!(reason.as_str());
+            }
+            value
+        }
     }
 }
 
@@ -392,13 +688,153 @@ fn add_provider_item_metadata(
     }
 }
 
+/// Whether one hosted Responses item type names a tool INVOCATION.
+///
+/// Only invocations join the ledger's tool names: the hosted union also
+/// carries results (`*_call_output`), approvals, listings, and opaque
+/// conversation items (`additional_tools`, `compaction`), and recording one
+/// of those would report a tool call that never occurred.
+pub fn hosted_item_type_is_invocation(item_type: &str) -> bool {
+    item_type.ends_with("_call")
+}
+
 /// Validate one raw tool-argument accumulation as a single JSON object.
+///
+/// The parse-failure reason carries serde's positional description (token
+/// category and line/column, never input bytes), so an unparsable shape is
+/// diagnosable from the boundary log without ever logging payload.
 pub fn require_json_object_text(raw: &str) -> Result<(), String> {
     match serde_json::from_str::<Value>(raw) {
         Ok(Value::Object(_)) => Ok(()),
         Ok(_) => Err("streamed tool arguments must decode to an object".to_string()),
-        Err(_) => Err("streamed tool arguments are not valid JSON".to_string()),
+        Err(error) => Err(format!(
+            "streamed tool arguments are not valid JSON: {error}"
+        )),
     }
+}
+
+/// Incremental scan of one JSON-argument accumulation that knows the byte at
+/// which the top-level value closed.
+///
+/// A tool call's arguments are one JSON object, so nothing a provider streams
+/// after the byte that closes it can be argument content: it is either an
+/// extra delta the shim never should have sent or noise. The scan is a
+/// constant-time-per-byte bracket/string tracker (never a re-parse of the
+/// whole accumulation), exact for any well-formed prefix; a malformed prefix
+/// simply never closes and keeps the strict parse at completion.
+#[derive(Debug, Clone, Default)]
+pub struct JsonValueScan {
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+    /// Whether the top-level value has closed (depth returned to zero after
+    /// a container opened).
+    pub closed: bool,
+}
+
+impl JsonValueScan {
+    /// Feed one fragment; returns the byte offset within it at which the
+    /// top-level value closed (exclusive, i.e. the first byte of the tail),
+    /// or `None` when the fragment left the value open. Only ASCII
+    /// structural bytes advance the scan, so the offset is always a char
+    /// boundary.
+    pub fn feed(&mut self, fragment: &str) -> Option<usize> {
+        if self.closed {
+            return Some(0);
+        }
+        for (offset, byte) in fragment.bytes().enumerate() {
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' if self.depth > 0 => {
+                    self.depth -= 1;
+                    if self.depth == 0 {
+                        self.closed = true;
+                        return Some(offset + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
+/// Why a tail streamed after a complete argument object was dropped rather
+/// than failing the call. Each shape reproduces exactly one parse, so no
+/// argument content is ever invented or chosen between alternatives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedundantTail {
+    /// Only whitespace (a pretty-printed buffer's trailing newline).
+    Whitespace,
+    /// One or more exact repetitions of the complete value (`{}{}`, a
+    /// duplicated whole-object delta).
+    DuplicateValue,
+    /// Empty JSON literals after a zero-argument call (`{}""`: Azure
+    /// Foundry's DeepSeek shim, live 2026-09-10, 222 attempts in one day).
+    EmptyLiterals,
+}
+
+impl RedundantTail {
+    fn as_str(self) -> &'static str {
+        match self {
+            RedundantTail::Whitespace => "whitespace",
+            RedundantTail::DuplicateValue => "duplicate_value",
+            RedundantTail::EmptyLiterals => "empty_literals",
+        }
+    }
+}
+
+/// Classify the bytes a provider streamed AFTER its argument object closed.
+///
+/// Accepts only tails whose removal is unambiguous: whitespace; exact
+/// repetitions of the whole value; and, after a zero-argument `{}` only,
+/// empty literals (`""`, `{}`, `[]`) that carry no argument content. A tail
+/// that is merely a suffix of the value (`{"a":1}}`) is NOT accepted: the same
+/// bytes arise from a dropped inner delta (`{"a":1,"b":{` lost from
+/// `{"a":1,"b":{"c":2}}`), so the parse would be a guess.
+pub fn redundant_tail(value: &str, tail: &str) -> Option<RedundantTail> {
+    let value = value.trim();
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return Some(RedundantTail::Whitespace);
+    }
+    let mut rest = tail;
+    let mut duplicates = true;
+    while !rest.is_empty() {
+        match rest.strip_prefix(value) {
+            Some(after) if !value.is_empty() => rest = after.trim_start(),
+            _ => {
+                duplicates = false;
+                break;
+            }
+        }
+    }
+    if duplicates {
+        return Some(RedundantTail::DuplicateValue);
+    }
+    if value != "{}" {
+        return None;
+    }
+    let mut rest = tail;
+    while !rest.is_empty() {
+        rest = rest
+            .strip_prefix("\"\"")
+            .or_else(|| rest.strip_prefix("{}"))
+            .or_else(|| rest.strip_prefix("[]"))?
+            .trim_start();
+    }
+    Some(RedundantTail::EmptyLiterals)
 }
 
 /// Accumulated per-stream state for one incrementally emitted function call.
@@ -406,28 +842,110 @@ pub fn require_json_object_text(raw: &str) -> Result<(), String> {
 pub struct ToolAccumulator {
     pub call_id: String,
     pub name: String,
+    /// Nested tool tree (Responses `namespace`) that declared this call.
+    pub namespace: Option<String>,
+    /// Opaque SDK 3.0 `caller` attribution carried verbatim.
+    pub caller: Option<Value>,
     pub provider_item_id: Option<String>,
     pub provider_status: Option<ProviderOutputItemStatus>,
     pub raw_arguments: String,
     pub completed: bool,
     pub custom: bool,
+    /// Whether this is a provider-executed Anthropic server tool
+    /// (`server_tool_use`), whose lifecycle events stay on the dedicated
+    /// server-tool variants and never count toward the tool-use stop reason.
+    pub server: bool,
+    /// Scan of `raw_arguments` for dialects that accumulate through
+    /// [`ToolAccumulator::push_arguments`]; dialects that append directly
+    /// leave it untouched and never withhold anything.
+    scan: JsonValueScan,
+    /// Bytes streamed after the argument object closed, never emitted to the
+    /// caller; reconciled by [`ToolAccumulator::complete`].
+    pub withheld_tail: String,
+    /// Whether the call's start (its name) has been emitted to the caller. A
+    /// relay may open a tool entry with an empty name and supply it later;
+    /// until then the entry accumulates silently and, if it never earns a
+    /// name or an argument, is dropped as a phantom instead of failing.
+    pub started: bool,
+    /// Whether the call id was minted by the gateway because the provider
+    /// streamed a null or empty one; a later restated id is then ignored.
+    pub id_synthesized: bool,
 }
+
+/// Opaque tool IDs share the Python model bound, including signature carriers.
+const MAXIMUM_TOOL_CALL_ID_CHARACTERS: usize = 65_536;
 
 impl ToolAccumulator {
     pub fn new(call_id: String, name: String) -> Self {
         Self {
             call_id,
             name,
+            namespace: None,
+            caller: None,
             provider_item_id: None,
             provider_status: None,
             raw_arguments: String::new(),
             completed: false,
             custom: false,
+            server: false,
+            scan: JsonValueScan::default(),
+            withheld_tail: String::new(),
+            started: true,
+            id_synthesized: false,
+        }
+    }
+
+    /// Append one streamed argument fragment, returning the part the caller
+    /// may see: everything up to and including the byte that closes the
+    /// argument object. Whatever follows that byte is withheld (never
+    /// emitted) and judged at completion, so the deltas a client receives
+    /// always concatenate to the completed call's bytes. Custom (freeform)
+    /// input is opaque text and passes through whole.
+    pub fn push_arguments(&mut self, fragment: &str) -> Option<String> {
+        if self.custom {
+            self.raw_arguments.push_str(fragment);
+            return Some(fragment.to_string());
+        }
+        match self.scan.feed(fragment) {
+            None => {
+                self.raw_arguments.push_str(fragment);
+                Some(fragment.to_string())
+            }
+            Some(closed_at) => {
+                let (value, tail) = fragment.split_at(closed_at);
+                self.raw_arguments.push_str(value);
+                self.withheld_tail.push_str(tail);
+                (!value.is_empty()).then(|| value.to_string())
+            }
         }
     }
 
     pub fn complete(&self) -> Result<CompletedToolCall, String> {
         if !self.custom {
+            if !self.withheld_tail.is_empty() {
+                // A provider streamed bytes after its argument object closed.
+                // Only a content-free tail is dropped (its shape reaches the
+                // operator log; never its bytes); anything else is validated
+                // as the concatenation the provider actually sent, so the
+                // failure names the same parse position it always did.
+                match redundant_tail(&self.raw_arguments, &self.withheld_tail) {
+                    Some(RedundantTail::Whitespace) => {}
+                    Some(shape) => {
+                        let line = serde_json::json!({
+                            "event": "tool_arguments_tail_dropped",
+                            "name": self.name,
+                            "shape": shape.as_str(),
+                            "tail_bytes": self.withheld_tail.len(),
+                        });
+                        eprintln!("exp-gateway-native: {line}");
+                    }
+                    None => {
+                        let mut streamed = self.raw_arguments.clone();
+                        streamed.push_str(&self.withheld_tail);
+                        require_json_object_text(&streamed)?;
+                    }
+                }
+            }
             // Custom (freeform) tool input is opaque text by contract; only
             // function arguments must parse as one JSON object.
             require_json_object_text(&self.raw_arguments)?;
@@ -436,9 +954,13 @@ impl ToolAccumulator {
         // exactly the same provider tool-call streams (a call the python
         // engine rejects must not become client-visible history here).
         if self.call_id.is_empty()
-            || self.call_id.chars().count() > 256
+            || self.call_id.chars().count() > MAXIMUM_TOOL_CALL_ID_CHARACTERS
             || self.name.is_empty()
             || self.name.chars().count() > 256
+            || self
+                .namespace
+                .as_ref()
+                .is_some_and(|namespace| namespace.is_empty() || namespace.chars().count() > 256)
             || self.raw_arguments.chars().count() > 4_000_000
         {
             return Err("streamed tool call is incomplete".to_string());
@@ -446,6 +968,8 @@ impl ToolAccumulator {
         Ok(CompletedToolCall {
             call_id: self.call_id.clone(),
             name: self.name.clone(),
+            namespace: self.namespace.clone(),
+            caller: self.caller.clone(),
             provider_item_id: self.provider_item_id.clone(),
             provider_status: self.provider_status,
             raw_arguments: self.raw_arguments.clone(),
@@ -454,379 +978,8 @@ impl ToolAccumulator {
     }
 }
 
-/// Largest count the durable ledger can persist: usage lands in signed
-/// 64-bit SQLite INTEGER columns, so anything above `i64::MAX` could never
-/// settle and is treated as a provider contract violation at the parser.
-pub const MAXIMUM_LEDGER_COUNT: u64 = i64::MAX as u64;
-
-/// Read an optional non-negative count, mirroring `require_integer`: absent
-/// or null counts as zero because providers omit zero-valued usage fields,
-/// while a present non-integer (or unpersistably large) value is a provider
-/// contract violation.
-pub fn count_or_zero(object: &Map<String, Value>, key: &str, label: &str) -> Result<u64, String> {
-    match object.get(key) {
-        None | Some(Value::Null) => Ok(0),
-        Some(value) => value
-            .as_u64()
-            .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
-            .ok_or_else(|| format!("{label} must be a non-negative integer")),
-    }
-}
-
-/// Read one optional token subset, mirroring `_optional_usage_detail`: an
-/// absent detail object stays unknown instead of zero.
-fn optional_usage_detail(
-    object: &Map<String, Value>,
-    detail_key: &str,
-    field_name: &str,
-    label: &str,
-) -> Result<Option<u64>, String> {
-    let details = match object.get(detail_key) {
-        None | Some(Value::Null) => return Ok(None),
-        Some(value) => value
-            .as_object()
-            .ok_or_else(|| format!("{label} details must be an object"))?,
-    };
-    match details.get(field_name) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => value
-            .as_u64()
-            .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
-            .map(Some)
-            .ok_or_else(|| format!("{label} must be a non-negative integer")),
-    }
-}
-
-/// Parse an OpenAI-shaped usage object from a terminal Responses payload,
-/// mirroring `streaming_usage.openai_usage`: an omitted object is unknown
-/// usage, while a malformed one fails the stream.
-pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
-    let value = match value {
-        None | Some(Value::Null) => return Ok(None),
-        Some(value) => value,
-    };
-    let object = value
-        .as_object()
-        .ok_or_else(|| "OpenAI usage must be an object".to_string())?;
-    Ok(Some(Usage {
-        input_tokens: Some(count_or_zero(
-            object,
-            "input_tokens",
-            "OpenAI input_tokens",
-        )?),
-        output_tokens: Some(count_or_zero(
-            object,
-            "output_tokens",
-            "OpenAI output_tokens",
-        )?),
-        cached_input_tokens: optional_usage_detail(
-            object,
-            "input_tokens_details",
-            "cached_tokens",
-            "OpenAI cached_tokens",
-        )?,
-        reasoning_tokens: optional_usage_detail(
-            object,
-            "output_tokens_details",
-            "reasoning_tokens",
-            "OpenAI reasoning_tokens",
-        )?,
-    }))
-}
-
-/// Parse a Chat Completions usage object, mirroring
-/// `streaming_usage.openai_compatible_usage`: a malformed object fails the
-/// stream instead of silently dropping token accounting.
-pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "OpenAI-compatible usage must be an object".to_string())?;
-    Ok(Usage {
-        input_tokens: Some(count_or_zero(object, "prompt_tokens", "prompt_tokens")?),
-        output_tokens: Some(count_or_zero(
-            object,
-            "completion_tokens",
-            "completion_tokens",
-        )?),
-        cached_input_tokens: optional_usage_detail(
-            object,
-            "prompt_tokens_details",
-            "cached_tokens",
-            "cached_tokens",
-        )?,
-        reasoning_tokens: optional_usage_detail(
-            object,
-            "completion_tokens_details",
-            "reasoning_tokens",
-            "reasoning_tokens",
-        )?,
-    })
-}
-
-/// Parse Gemini `usageMetadata`, mirroring the python `_usage` normalizer:
-/// cached tokens are an input subset, absent counts are zero (`require_integer`
-/// parity), and `thoughtsTokenCount` stays unknown when omitted.
-pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "Gemini usageMetadata must be an object".to_string())?;
-    let reasoning_tokens = match object.get("thoughtsTokenCount") {
-        None | Some(Value::Null) => None,
-        Some(_) => Some(count_or_zero(
-            object,
-            "thoughtsTokenCount",
-            "Gemini thoughtsTokenCount",
-        )?),
-    };
-    Ok(Usage {
-        input_tokens: Some(count_or_zero(
-            object,
-            "promptTokenCount",
-            "Gemini promptTokenCount",
-        )?),
-        output_tokens: Some(count_or_zero(
-            object,
-            "candidatesTokenCount",
-            "Gemini candidatesTokenCount",
-        )?),
-        cached_input_tokens: Some(count_or_zero(
-            object,
-            "cachedContentTokenCount",
-            "Gemini cachedContentTokenCount",
-        )?),
-        reasoning_tokens,
-    })
-}
-
-/// Parse Bedrock `metadata.usage`, mirroring the python `_usage` normalizer:
-/// cache read and write legs fold into total input, cached input reports the
-/// read leg, and absent counts are zero (`require_integer` parity). Legs and
-/// the folded total beyond the persistable ledger range are provider
-/// contract violations and fail the stream rather than reaching settlement
-/// as a value the ledger could never write.
-pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
-    let usage = value
-        .and_then(Value::as_object)
-        .ok_or_else(|| "Bedrock metadata.usage must be an object".to_string())?;
-    let fresh = count_or_zero(usage, "inputTokens", "Bedrock inputTokens")?;
-    let cache_read = count_or_zero(
-        usage,
-        "cacheReadInputTokens",
-        "Bedrock cacheReadInputTokens",
-    )?;
-    let cache_write = count_or_zero(
-        usage,
-        "cacheWriteInputTokens",
-        "Bedrock cacheWriteInputTokens",
-    )?;
-    let input_tokens = fresh
-        .checked_add(cache_read)
-        .and_then(|total| total.checked_add(cache_write))
-        .filter(|total| *total <= MAXIMUM_LEDGER_COUNT)
-        .ok_or_else(|| "Bedrock input token total overflows a persistable count".to_string())?;
-    Ok(Usage {
-        input_tokens: Some(input_tokens),
-        output_tokens: Some(count_or_zero(
-            usage,
-            "outputTokens",
-            "Bedrock outputTokens",
-        )?),
-        cached_input_tokens: Some(cache_read),
-        reasoning_tokens: None,
-    })
-}
-
-/// Fetch a required string field from a provider JSON object.
-pub fn require_string(
-    object: &Map<String, Value>,
-    key: &str,
-    label: &str,
-) -> Result<String, String> {
-    object
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| format!("{label} must be text"))
-}
-
-/// Fetch a required provider identity with the public contract's character bound.
-pub fn require_bounded_string(
-    object: &Map<String, Value>,
-    key: &str,
-    label: &str,
-    maximum_chars: usize,
-) -> Result<String, String> {
-    let value = require_string(object, key, label)?;
-    let length = value.chars().count();
-    if length == 0 || length > maximum_chars {
-        return Err(format!(
-            "{label} must contain between 1 and {maximum_chars} characters"
-        ));
-    }
-    Ok(value)
-}
-
-/// Fetch a required non-negative integer field from a provider JSON object,
-/// bounded like every parsed count so no downstream consumer can receive a
-/// value outside the persistable signed 64-bit range.
-pub fn require_u64(object: &Map<String, Value>, key: &str, label: &str) -> Result<u64, String> {
-    object
-        .get(key)
-        .and_then(Value::as_u64)
-        .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
-        .ok_or_else(|| format!("{label} must be a non-negative integer"))
-}
+mod usage;
+pub use usage::*;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn output_tokens_lead_a_turn_but_control_frames_do_not() {
-        // Content, reasoning, and tool-call deltas are the first visible output.
-        assert!(Event::TextDelta("hi".to_string()).is_output_token());
-        assert!(Event::RefusalDelta("no".to_string()).is_output_token());
-        assert!(Event::ProviderTextDelta {
-            output_index: 0,
-            item_id: "msg_1".to_string(),
-            delta: "hi".to_string(),
-        }
-        .is_output_token());
-        assert!(Event::ThinkingDelta {
-            index: 0,
-            delta: "hmm".to_string(),
-        }
-        .is_output_token());
-        // A tool-only turn's first token is the tool call itself.
-        assert!(Event::ToolCallStarted {
-            index: 0,
-            call_id: "call_1".to_string(),
-            name: "get".to_string(),
-        }
-        .is_output_token());
-        // Usage, terminals, and opaque reasoning-carrier frames never lead.
-        assert!(!Event::Usage(Usage::default()).is_output_token());
-        assert!(!Event::Completed.is_output_token());
-        assert!(!Event::Incomplete.is_output_token());
-        assert!(!Event::ThinkingSignature {
-            index: 0,
-            signature: "sig".to_string(),
-        }
-        .is_output_token());
-        // A Responses item-start reserves a slot before the first delta; it
-        // must not stamp TTFT early -- the following delta is the real token.
-        assert!(!Event::ProviderOutputItemStarted {
-            output_index: 0,
-            item_id: Some("msg_1".to_string()),
-            kind: ProviderOutputItemKind::Message,
-            status: None,
-            phase: None,
-        }
-        .is_output_token());
-        // An empty delta (role-establishing or empty refusal frame) carries no
-        // visible token, so it must not stamp TTFT.
-        assert!(!Event::TextDelta(String::new()).is_output_token());
-        assert!(!Event::RefusalDelta(String::new()).is_output_token());
-        assert!(!Event::ProviderTextDelta {
-            output_index: 0,
-            item_id: "msg_1".to_string(),
-            delta: String::new(),
-        }
-        .is_output_token());
-    }
-
-    #[test]
-    fn openai_compatible_usage_counts_absent_fields_as_zero() {
-        let usage = openai_compatible_usage(&json!({"prompt_tokens": 7})).expect("valid usage");
-        assert_eq!(usage.input_tokens, Some(7));
-        assert_eq!(usage.output_tokens, Some(0));
-        assert_eq!(usage.cached_input_tokens, None);
-        assert_eq!(usage.reasoning_tokens, None);
-    }
-
-    #[test]
-    fn openai_compatible_usage_rejects_malformed_counts() {
-        assert!(openai_compatible_usage(&json!({"prompt_tokens": "7"})).is_err());
-        assert!(
-            openai_compatible_usage(&json!({"prompt_tokens": MAXIMUM_LEDGER_COUNT + 1})).is_err()
-        );
-        assert!(openai_compatible_usage(&json!([1])).is_err());
-        assert!(openai_compatible_usage(
-            &json!({"prompt_tokens": 1, "completion_tokens": 1, "prompt_tokens_details": 3})
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn parsed_counts_are_bounded_to_the_persistable_ledger_range() {
-        let at_bound = json!({"count": MAXIMUM_LEDGER_COUNT});
-        let over_bound = json!({"count": MAXIMUM_LEDGER_COUNT + 1});
-        let at_object = at_bound.as_object().expect("object");
-        let over_object = over_bound.as_object().expect("object");
-        // Exactly i64::MAX is persistable and accepted; one past it is a
-        // provider contract violation everywhere counts are parsed.
-        assert_eq!(
-            count_or_zero(at_object, "count", "count"),
-            Ok(MAXIMUM_LEDGER_COUNT)
-        );
-        assert!(count_or_zero(over_object, "count", "count").is_err());
-        assert_eq!(
-            require_u64(at_object, "count", "count"),
-            Ok(MAXIMUM_LEDGER_COUNT)
-        );
-        assert!(require_u64(over_object, "count", "count").is_err());
-        assert!(openai_usage(Some(&json!({
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "output_tokens_details": {"reasoning_tokens": MAXIMUM_LEDGER_COUNT + 1},
-        })))
-        .is_err());
-    }
-
-    #[test]
-    fn bedrock_usage_folds_cache_legs_and_rejects_unrepresentable_totals() {
-        let usage = bedrock_usage(Some(&json!({
-            "inputTokens": 9,
-            "outputTokens": 4,
-            "cacheReadInputTokens": 2,
-            "cacheWriteInputTokens": 1,
-        })))
-        .expect("valid usage");
-        assert_eq!(usage.input_tokens, Some(12));
-        assert_eq!(usage.cached_input_tokens, Some(2));
-        // A leg beyond the persistable ledger range fails at the parser.
-        assert!(bedrock_usage(Some(&json!({
-            "inputTokens": MAXIMUM_LEDGER_COUNT + 1,
-            "outputTokens": 1,
-        })))
-        .is_err());
-        // Individually persistable legs whose folded total is not are a
-        // provider contract violation, never a clamped or wrapped total.
-        assert!(bedrock_usage(Some(&json!({
-            "inputTokens": MAXIMUM_LEDGER_COUNT,
-            "outputTokens": 1,
-            "cacheReadInputTokens": 1,
-        })))
-        .is_err());
-        assert!(bedrock_usage(Some(&json!(null))).is_err());
-        assert!(bedrock_usage(None).is_err());
-    }
-
-    #[test]
-    fn openai_usage_treats_absent_and_null_objects_as_unknown() {
-        assert!(openai_usage(None).expect("absent is unknown").is_none());
-        assert!(openai_usage(Some(&serde_json::Value::Null))
-            .expect("null is unknown")
-            .is_none());
-        let usage = openai_usage(Some(&json!({
-            "input_tokens": 2,
-            "output_tokens": 3,
-            "output_tokens_details": {"reasoning_tokens": 1},
-        })))
-        .expect("valid usage")
-        .expect("usage present");
-        assert_eq!(usage.reasoning_tokens, Some(1));
-        assert_eq!(usage.cached_input_tokens, None);
-    }
-}
+mod tests;

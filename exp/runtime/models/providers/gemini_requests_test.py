@@ -6,11 +6,35 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall, ToolChoice
+from exp.common.models.content import DocumentContentPart, TextContentPart
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.gemini_requests import (
+    GEMINI_THOUGHT_SIGNATURE_BYPASS,
     gemini_generate_request,
     gemini_model_path,
 )
+
+
+@pytest.mark.parametrize("maximum", (None, 1, 8_192, 128_000))
+def test_gateway_style_gemini_builder_preserves_omission_or_exact_cap(maximum: int | None) -> None:
+    """Gateway calls opt out of the non-gateway model client's explicit default."""
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hi"),), maximum_output_tokens=maximum
+    )
+    payload = gemini_generate_request("gemini-2.5-pro", request, default_maximum_output_tokens=None)
+    generation = payload["generationConfig"]
+    assert isinstance(generation, dict)
+    if maximum is None:
+        assert "maxOutputTokens" not in generation
+    else:
+        assert generation["maxOutputTokens"] == maximum
+
+
+def test_model_client_gemini_default_remains_explicit() -> None:
+    """The non-gateway execution budget is unchanged by gateway omission policy."""
+    request = ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
+    payload = gemini_generate_request("gemini-2.5-pro", request)
+    assert payload["generationConfig"] == {"maxOutputTokens": 4096}
 
 
 def test_gemini_model_path_strips_the_optional_wire_prefix() -> None:
@@ -109,12 +133,55 @@ def test_gemini_generate_request_links_tool_results_to_prior_calls() -> None:
     assert isinstance(contents, list)
     assert contents[1] == {
         "role": "model",
-        "parts": [{"functionCall": {"name": "lookup", "args": {"q": "x"}}}],
+        "parts": [
+            {
+                "functionCall": {"name": "lookup", "args": {"q": "x"}},
+                "thoughtSignature": GEMINI_THOUGHT_SIGNATURE_BYPASS,
+            }
+        ],
     }
     assert contents[2] == {
         "role": "user",
         "parts": [{"functionResponse": {"name": "lookup", "response": {"content": "answer"}}}],
     }
+
+
+def test_gemini_generate_request_replays_every_function_call_with_the_bypass_signature() -> None:
+    """Each replayed function call carries Gemini's documented placeholder signature.
+
+    Gemini 3 rejects a follow-up turn (HTTP 400, ``missing a thought_signature``)
+    when a replayed ``functionCall`` part has no signature, and the gateway's
+    public surfaces cannot carry the real one back from the client.
+    """
+    calls = (
+        ToolCall(call_id="call-1", name="write", arguments={"path": "a"}),
+        ToolCall(call_id="call-2", name="read", arguments={"path": "b"}),
+    )
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="go"),
+            ModelMessage(
+                role="assistant",
+                content="working",
+                assistant_action=AssistantAction(tool_calls=calls),
+            ),
+            ModelMessage(role="tool", content="ok", tool_call_id="call-1"),
+            ModelMessage(role="tool", content="ok", tool_call_id="call-2"),
+        ),
+    )
+    payload = gemini_generate_request("gemini-3-flash-preview", request)
+
+    contents = payload["contents"]
+    assert isinstance(contents, list)
+    model_turn = contents[1]
+    assert isinstance(model_turn, dict)
+    parts = model_turn["parts"]
+    assert isinstance(parts, list)
+    assert parts[0] == {"text": "working"}
+    for part in parts[1:]:
+        assert isinstance(part, dict)
+        assert "functionCall" in part
+        assert part["thoughtSignature"] == "skip_thought_signature_validator"
 
 
 def test_gemini_generate_request_rejects_an_unlinked_tool_result() -> None:
@@ -124,3 +191,67 @@ def test_gemini_generate_request_rejects_an_unlinked_tool_result() -> None:
     )
     with pytest.raises(ValueError, match="no preceding tool-call name"):
         gemini_generate_request("gemini-2.5-pro", request)
+
+
+def test_gemini_generate_request_inlines_documents_in_caller_order() -> None:
+    """PDF parts ride the user turn as ``inline_data`` at their positions among text."""
+    pdf = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+    request = ModelRequest(
+        messages=(
+            ModelMessage(
+                role="user",
+                content="first second",
+                content_parts=(
+                    TextContentPart(text="first "),
+                    DocumentContentPart(data=pdf, name="a.pdf"),
+                    TextContentPart(text="second"),
+                    DocumentContentPart(data="JVBERi0xLjcK"),
+                ),
+            ),
+        ),
+    )
+    payload = gemini_generate_request("gemini-2.5-pro", request)
+    assert payload["contents"] == [
+        {
+            "role": "user",
+            "parts": [
+                {"text": "first "},
+                {"inline_data": {"mime_type": "application/pdf", "data": pdf}},
+                {"text": "second"},
+                {"inline_data": {"mime_type": "application/pdf", "data": "JVBERi0xLjcK"}},
+            ],
+        }
+    ]
+
+
+def test_gemini_folds_a_mid_conversation_system_turn_into_user_text_in_place() -> None:
+    """systemInstruction hoists only the leading run; a later instruction keeps its position.
+
+    Claude Code on the Chat wire injects a system turn after the first user
+    turn and after every tool result; the gateway used to refuse the whole
+    route for it. The text now rides as user content where the caller put it.
+    """
+    payload = gemini_generate_request(
+        "gemini-2.5-pro",
+        ModelRequest(
+            messages=(
+                ModelMessage(role="system", content="be terse"),
+                ModelMessage(role="system", content="answer in English"),
+                ModelMessage(role="user", content="hi"),
+                ModelMessage(role="system", content="# Environment\nPlatform: linux"),
+                ModelMessage(role="assistant", content="hello"),
+                ModelMessage(role="system", content="<total_tokens>1</total_tokens>"),
+                ModelMessage(role="user", content="go"),
+            ),
+            tools=(),
+        ),
+    )
+    assert payload["systemInstruction"] == {
+        "parts": [{"text": "be terse"}, {"text": "answer in English"}]
+    }
+    assert payload["contents"] == [
+        {"role": "user", "parts": [{"text": "hi\n\n# Environment\nPlatform: linux"}]},
+        {"role": "model", "parts": [{"text": "hello"}]},
+        {"role": "user", "parts": [{"text": "<total_tokens>1</total_tokens>"}]},
+        {"role": "user", "parts": [{"text": "go"}]},
+    ]

@@ -60,6 +60,7 @@ from exp.runtime.gateway import (
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.contracts import DirectTarget, ExecutionSnapshot
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.snapshot_integrity import refuse_self_inconsistent_snapshot
 from exp.runtime.gateway.sqlite.platform import SQLiteGatewayPlatform
 from exp.runtime.gateway.sqlite.store import (
     GatewayStoreError,
@@ -196,6 +197,67 @@ def test_default_adapter_constructs_existing_atomic_components(tmp_path: Path) -
     assert platform.budgets.database_path == platform.database_path
     assert platform.attempts.database_path == platform.database_path
     assert platform.exact_pool_revisions(organization_id="missing") == ()
+
+
+def test_activation_refuses_a_self_inconsistent_snapshot(tmp_path: Path) -> None:
+    """C2 write-side guard: a snapshot whose stored content does not hash to its
+    pinned digest is refused at activation so it never becomes an authority; a
+    matching one is accepted; and an absent file cannot be verified here, so it
+    is flagged and allowed rather than blocking a legitimate activation."""
+    normalized = NormalizedGatewayCatalog(
+        deployments=(
+            ExactModelDeployment(
+                deployment_id="deployment-one",
+                source_alias="deployment-one",
+                exact_model_id="exact-coding",
+                connection="openai",
+                provider="openai",
+                provider_model="gpt-test",
+                connection_sha256="b" * 64,
+                capabilities_sha256="c" * 64,
+            ),
+        ),
+        pools=(
+            ExactModelPool(
+                pool_id="coding-pool",
+                exact_model_id="exact-coding",
+                deployment_ids=("deployment-one",),
+            ),
+        ),
+    )
+    digest = normalized.identity_sha256()
+    snapshot_ref = f"catalog-snapshots/{digest}.json"
+    snapshot_path = tmp_path / snapshot_ref
+    snapshot_path.parent.mkdir()
+    snapshot_path.write_bytes(canonical_json_bytes(normalized))
+
+    # Matching content and digest: accepted.
+    refuse_self_inconsistent_snapshot(tmp_path, snapshot_ref, digest)
+
+    # Present file pinned under the wrong digest (the 6d85fcc0 shape): refused.
+    with pytest.raises(ValueError, match="does not match its pinned digest"):
+        refuse_self_inconsistent_snapshot(tmp_path, snapshot_ref, "a" * 64)
+
+    # Absent file: unverifiable on this node, flagged and allowed.
+    refuse_self_inconsistent_snapshot(tmp_path, "catalog-snapshots/missing.json", "a" * 64)
+
+    # Present but unreadable (here a directory at the path -> a non-absent OSError):
+    # NOT the remote-node case, so it fails closed rather than pinning unverified.
+    (tmp_path / "catalog-snapshots" / "unreadable.json").mkdir()
+    with pytest.raises(ValueError, match="not a readable local file"):
+        refuse_self_inconsistent_snapshot(tmp_path, "catalog-snapshots/unreadable.json", digest)
+
+    # Broken symlink at the reference: a present dangling entry -> fails closed.
+    broken = tmp_path / "catalog-snapshots" / "broken.json"
+    broken.symlink_to(tmp_path / "catalog-snapshots" / "does-not-exist.json")
+    with pytest.raises(ValueError, match="not a readable local file"):
+        refuse_self_inconsistent_snapshot(tmp_path, "catalog-snapshots/broken.json", digest)
+
+    # A broken symlink at a PARENT component (the snapshots directory itself)
+    # also fails closed -- the reference is not a symlink but its parent is.
+    (tmp_path / "linked").symlink_to(tmp_path / "missing-dir")
+    with pytest.raises(ValueError, match="not a readable local file"):
+        refuse_self_inconsistent_snapshot(tmp_path, "linked/x.json", digest)
 
 
 def test_default_adapter_reads_complete_local_pool_revisions(tmp_path: Path) -> None:
@@ -346,7 +408,7 @@ def test_naturally_idempotent_mutations_are_tenant_scoped_and_unreceipted(
         organization_id="org-one",
         period="2026-08",
         scope=MonthlyBudgetScope(kind=MonthlyBudgetScopeKind.TEAM),
-        limit_micro_usd=1_000,
+        limit_nano_usd=1_000,
     )
     assert platform.set_monthly_budget(budget).changed
     assert not platform.set_monthly_budget(budget).changed
@@ -558,7 +620,7 @@ def test_revision_reads_forward_existing_sqlite_authority(tmp_path: Path) -> Non
         organization_id="org-one",
         period="2026-08",
         scope=BudgetScope(kind=BudgetScopeKind.TEAM),
-        limit_micro_usd=1_000,
+        limit_nano_usd=1_000,
     )
 
     provider = platform.provider_connection_revisions(organization_id="org-one")[0]
@@ -576,7 +638,7 @@ def test_revision_reads_forward_existing_sqlite_authority(tmp_path: Path) -> Non
         platform.monthly_budgets(
             organization_id="org-one",
             period="2026-08",
-        )[0].remaining_micro_usd
+        )[0].remaining_nano_usd
         == 1_000
     )
 
@@ -669,8 +731,8 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
         capabilities=ModelCapabilities(maximum_output_tokens=16),
         gateway=GatewayDeploymentMetadata(
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=1_000_000,
-                output_micro_usd_per_million_tokens=1_000_000,
+                input_nano_usd_per_million_tokens=1_000_000,
+                output_nano_usd_per_million_tokens=1_000_000,
             )
         ),
     )
@@ -682,7 +744,7 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
             deployment=deployment,
             attempt_ordinal=0,
             route_depth=0,
-            maximum_cost_micro_usd=100,
+            maximum_cost_nano_usd=100,
         )
     )
     assert (
@@ -693,7 +755,7 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
                 deployment=deployment,
                 attempt_ordinal=0,
                 route_depth=0,
-                maximum_cost_micro_usd=100,
+                maximum_cost_nano_usd=100,
             )
         )
         == reservation
@@ -706,7 +768,7 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
                 deployment=deployment,
                 attempt_ordinal=0,
                 route_depth=0,
-                maximum_cost_micro_usd=101,
+                maximum_cost_nano_usd=101,
             )
         )
     with pytest.raises(ValueError, match="differs from durable accounting input"):
@@ -723,7 +785,7 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
                 ),
                 attempt_ordinal=0,
                 route_depth=0,
-                maximum_cost_micro_usd=100,
+                maximum_cost_nano_usd=100,
             )
         )
     settlement = platform.settle_attempt(
@@ -738,11 +800,11 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
         )
     )
 
-    assert reservation.reserved_micro_usd == 100
+    assert reservation.reserved_nano_usd == 100
     assert settlement.reservation == reservation
     assert settlement.state == "completed"
     assert settlement.usage == GatewayUsage(input_tokens=10, output_tokens=5)
-    assert settlement.settled_micro_usd == 15
+    assert settlement.settled_nano_usd == 15
     with pytest.raises(ValueError, match="differs from durable"):
         platform.settle_attempt(
             AttemptSettlementRequest(
@@ -771,7 +833,7 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
             deployment=deployment,
             attempt_ordinal=0,
             route_depth=0,
-            maximum_cost_micro_usd=100,
+            maximum_cost_nano_usd=100,
         )
     )
     terminal = GatewayEvent(
@@ -797,7 +859,7 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
             )
         )
     usage = platform.usage_attribution(organization_id="org-one")
-    assert usage.identities[0].known_estimated_cost_micro_usd == 17
+    assert usage.identities[0].known_estimated_cost_nano_usd == 17
     assert usage.identities[0].terminal_counts[0].state == "completed"
     with pytest.raises(ValueError, match="does not belong"):
         platform.settle_attempt(
@@ -872,8 +934,8 @@ def test_settlement_surfaces_first_token_time_for_ttft(tmp_path: Path) -> None:
         capabilities_sha256="c" * 64,
         gateway=GatewayDeploymentMetadata(
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=1_000_000,
-                output_micro_usd_per_million_tokens=1_000_000,
+                input_nano_usd_per_million_tokens=1_000_000,
+                output_nano_usd_per_million_tokens=1_000_000,
             )
         ),
     )
@@ -884,7 +946,7 @@ def test_settlement_surfaces_first_token_time_for_ttft(tmp_path: Path) -> None:
             deployment=deployment,
             attempt_ordinal=0,
             route_depth=0,
-            maximum_cost_micro_usd=100,
+            maximum_cost_nano_usd=100,
         )
     )
     first_token_at = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)

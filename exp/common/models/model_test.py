@@ -18,12 +18,15 @@ from exp.common.models import (
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
+    RawEmbedding,
+    RawEmbeddingBatch,
     RoutedCandidateSnapshot,
     ToolCall,
     ToolChoice,
     Usage,
     combine_economics,
 )
+from exp.common.models.content import ImageContentPart, TextContentPart, VideoContentPart
 from exp.common.tasks import ToolSchema
 
 _CAPABILITIES_DIGEST = "a" * 64
@@ -103,15 +106,22 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
     assert ModelCapabilities(supports_tools=True).model_dump(mode="json") == {
         "supports_tools": True,
         "supports_embeddings": None,
+        "supports_image_generation": None,
+        "emits_images": False,
         "supports_structured_output": False,
         "supports_completions": None,
         "supports_temperature": True,
         "supports_top_p": None,
         "supports_top_k": None,
         "supports_logprobs": None,
+        "supports_frequency_penalty": None,
+        "supports_presence_penalty": None,
         "supports_reasoning": False,
         "reasoning_effort": None,
         "sampling_requires_reasoning_none": False,
+        "reasoning_output_exposed": False,
+        "reasoning_content_native": False,
+        "system_messages_leading_only": False,
         "chat_max_tokens_field": None,
         "minimum_temperature": None,
         "maximum_temperature": None,
@@ -125,6 +135,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "output_cost_per_million_tokens_usd": None,
         "cached_input_cost_per_million_tokens_usd": None,
         "cache_write_cost_per_million_tokens_usd": None,
+        "service_tier_pricing_enabled": False,
     }
     with pytest.raises(ValidationError, match="named tool_choice"):
         ModelRequest(
@@ -197,6 +208,34 @@ def test_model_messages_reject_tool_and_assistant_fields_on_the_wrong_roles() ->
         ModelMessage(role="tool", content="missing linkage")
 
 
+def test_model_messages_carry_image_parts_on_user_and_tool_roles_only() -> None:
+    """A tool result holds a screenshot beside its text; no other non-user role does."""
+    image = ImageContentPart(media_type="image/png", data="aGk=")
+    tool = ModelMessage(
+        role="tool",
+        tool_call_id="call-1",
+        content="shot",
+        content_parts=(TextContentPart(text="shot"), image),
+    )
+    assert tool.images == (image,)
+    with pytest.raises(ValidationError, match="valid only for user and tool messages"):
+        ModelMessage(
+            role="assistant",
+            content="shot",
+            content_parts=(TextContentPart(text="shot"), image),
+        )
+    with pytest.raises(ValidationError, match="tool messages carry only text and image parts"):
+        ModelMessage(
+            role="tool",
+            tool_call_id="call-1",
+            content="clip",
+            content_parts=(
+                TextContentPart(text="clip"),
+                VideoContentPart(media_type="video/mp4", data="aGk="),
+            ),
+        )
+
+
 def test_tool_call_preserves_optional_raw_arguments_without_changing_legacy_payloads() -> None:
     """Raw provider JSON replays exactly but stays outside semantic artifact payloads."""
     legacy = ToolCall(call_id="call-1", name="lookup", arguments={"a": 1, "b": 2})
@@ -263,6 +302,26 @@ def test_embeddings_require_nonempty_finite_vectors() -> None:
         Embedding(values=(0.1, -0.2))
 
 
+def test_raw_embeddings_preserve_magnitude_but_still_reject_bad_vectors() -> None:
+    """The public-surface carrier keeps raw magnitude yet enforces finiteness."""
+    # A non-unit vector that Embedding would reject is valid raw output.
+    assert RawEmbedding(values=(0.1, -0.2)).values == (0.1, -0.2)
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        RawEmbedding(values=())
+    with pytest.raises(ValidationError, match="finite"):
+        RawEmbedding(values=(float("inf"),))
+    batch = RawEmbeddingBatch(
+        embeddings=(RawEmbedding(values=(0.1, -0.2)),),
+        prompt_tokens=5,
+        served_model_id="text-embedding-3-small",
+    )
+    assert batch.prompt_tokens == 5
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        RawEmbeddingBatch(embeddings=(), prompt_tokens=0)
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        RawEmbeddingBatch(embeddings=(RawEmbedding(values=(1.0,)),), prompt_tokens=-1)
+
+
 def test_combine_economics_sums_present_usage_and_complete_measurements() -> None:
     """Usage sums when present. Cost and latency stay unknown unless every call reports them."""
     observed = NumericMeasurement(value=0.4, provenance="observed")
@@ -285,6 +344,102 @@ def test_combine_economics_sums_present_usage_and_complete_measurements() -> Non
     assert combined.cost_usd == NumericMeasurement(value=0.5, provenance="estimated")
     assert combined.latency_seconds is None
     assert combine_economics(()) == OperationEconomics()
+
+
+def test_combine_economics_preserves_cache_write_when_every_record_reports_it() -> None:
+    """Aggregated usage keeps cache-write counts only when every record carries them."""
+    first = OperationEconomics(
+        usage=Usage(
+            input_tokens=100,
+            output_tokens=10,
+            cached_input_tokens=20,
+            cache_write_input_tokens=30,
+        ),
+        cost_usd=NumericMeasurement(value=0.2, provenance="observed"),
+        latency_seconds=NumericMeasurement(value=0.4, provenance="observed"),
+    )
+    second = OperationEconomics(
+        usage=Usage(
+            input_tokens=50,
+            output_tokens=5,
+            cached_input_tokens=10,
+            cache_write_input_tokens=15,
+        ),
+        cost_usd=NumericMeasurement(value=0.1, provenance="observed"),
+        latency_seconds=NumericMeasurement(value=0.2, provenance="observed"),
+    )
+    partial = OperationEconomics(
+        usage=Usage(input_tokens=20, output_tokens=2, cached_input_tokens=5),
+        cost_usd=NumericMeasurement(value=0.05, provenance="observed"),
+    )
+
+    complete = combine_economics((first, second))
+    mixed = combine_economics((first, partial))
+    zero_write = combine_economics(
+        (
+            OperationEconomics(
+                usage=Usage(
+                    input_tokens=10,
+                    output_tokens=1,
+                    cached_input_tokens=2,
+                    cache_write_input_tokens=0,
+                ),
+            ),
+            OperationEconomics(
+                usage=Usage(
+                    input_tokens=10,
+                    output_tokens=1,
+                    cached_input_tokens=3,
+                    cache_write_input_tokens=0,
+                ),
+            ),
+        )
+    )
+
+    assert complete.usage == Usage(
+        input_tokens=150,
+        output_tokens=15,
+        cached_input_tokens=30,
+        cache_write_input_tokens=45,
+    )
+    assert mixed.usage == Usage(
+        input_tokens=120,
+        output_tokens=12,
+        cached_input_tokens=25,
+        cache_write_input_tokens=None,
+    )
+    assert zero_write.usage == Usage(
+        input_tokens=20,
+        output_tokens=2,
+        cached_input_tokens=5,
+        cache_write_input_tokens=0,
+    )
+    assert zero_write.usage is not None
+    assert zero_write.usage.cache_write_input_tokens == 0
+
+
+def test_combine_economics_cache_write_partial_mode_keeps_only_complete_subset() -> None:
+    """Partial aggregation keeps cache-write totals only from the present subset."""
+    priced = OperationEconomics(
+        usage=Usage(
+            input_tokens=10,
+            output_tokens=2,
+            cached_input_tokens=4,
+            cache_write_input_tokens=2,
+        ),
+        cost_usd=NumericMeasurement(value=0.5, provenance="observed"),
+    )
+    unmetered = OperationEconomics()
+
+    strict = combine_economics((priced, unmetered))
+    relaxed = combine_economics((priced, unmetered), require_complete_usage=False)
+    empty_relaxed = combine_economics((unmetered,), require_complete_usage=False)
+
+    assert strict.usage is None
+    assert relaxed.usage == priced.usage
+    assert relaxed.usage is not None
+    assert relaxed.usage.cache_write_input_tokens == 2
+    assert empty_relaxed.usage is None
 
 
 def test_unknown_support_flags_change_the_frozen_capability_identity_digest() -> None:
@@ -311,3 +466,34 @@ def test_generation_parameter_contract_rejects_inverted_ranges() -> None:
         ModelCapabilities(minimum_top_k=10, maximum_top_k=5)
     with pytest.raises(ValidationError, match="conditional sampling requires reasoning support"):
         ModelCapabilities(sampling_requires_reasoning_none=True)
+
+
+def test_reasoning_content_native_is_a_gateway_flag_outside_the_frozen_identity() -> None:
+    """The native reasoning_content declaration defaults off and never re-digests a catalog."""
+    assert ModelCapabilities().reasoning_content_native is False
+    assert (
+        ModelCapabilities(reasoning_content_native=True).identity_sha256()
+        == ModelCapabilities().identity_sha256()
+    )
+
+
+def test_system_messages_leading_only_is_a_gateway_flag_outside_the_frozen_identity() -> None:
+    """The leading-only system declaration defaults off and never re-digests a catalog."""
+    assert ModelCapabilities().system_messages_leading_only is False
+    assert (
+        ModelCapabilities(system_messages_leading_only=True).identity_sha256()
+        == ModelCapabilities().identity_sha256()
+    )
+
+
+def test_emits_images_stays_out_of_the_capability_identity() -> None:
+    """Emitting images is a data-plane settlement fact, never a dispatch contract.
+
+    Like ``supports_image_generation`` it is excluded from the capability
+    identity, so projecting it onto the text+image chat lanes leaves every
+    pinned ``capabilities_sha256`` where it was.
+    """
+    plain = ModelCapabilities(supports_tools=True)
+    emitting = ModelCapabilities(supports_tools=True, emits_images=True)
+    assert plain.identity_sha256() == emitting.identity_sha256()
+    assert emitting.emits_images is True and plain.emits_images is False

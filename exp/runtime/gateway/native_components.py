@@ -41,9 +41,13 @@ class SyncWriteLedger(Protocol):
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
+        reserved_input_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
         fallback_reason: str | None = None,
+        dispatch_reason: str | None = None,
+        preferred_deployment: ExactModelDeployment | None = None,
     ) -> AttemptId:
         """Durably mark one provider dispatch before network work."""
         ...
@@ -56,8 +60,32 @@ class SyncWriteLedger(Protocol):
         failure: GatewayFailure | None,
         finalize_request: bool = True,
         first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int = 0,
+        tool_search_requests: int = 0,
     ) -> None:
-        """Durably settle one attempt exactly once."""
+        """Durably settle one attempt exactly once.
+
+        The ``retry_after_seconds`` and ``ratelimit_*`` values are the
+        provider's own rate-limit response headers, normalized, present on
+        successes and failures alike when the data plane harvested any; a
+        hosted ledger persists them per attempt for calibration analytics.
+        ``upstream_provider`` is the upstream an aggregator rung (OpenRouter)
+        named as having served the attempt in its response metadata, so a
+        zero-data-retention dispatch records which retention-free upstream
+        answered; ``None`` on every rung that names none.
+        ``web_search_requests`` counts the gateway-executed web searches billed
+        to the attempt, never a provider meter; the hosted ledger prices them
+        per attempt, and the engine omits the keyword entirely at zero.
+        ``tool_search_requests`` counts the gateway-executed tool-search rounds
+        billed to the attempt under the same rules: never a provider meter,
+        priced by the hosted ledger, omitted entirely at zero.
+        """
         ...
 
     def finish_request(
@@ -96,6 +124,18 @@ class NativeGatewayComponents(Protocol):
         share fsync batches. Hosted compositions over their own stores return
         ``None`` (or omit the attribute); the control plane then settles
         directly through :attr:`ledger`.
+        """
+        ...
+
+    @property
+    def batches(self) -> object | None:
+        """Return the optional batch control plane serving /v1/batches.
+
+        Hosts without the batch lane return ``None`` (or omit the attribute);
+        the control plane then answers every batch route with a uniform
+        not-enabled error. The returned object is a
+        ``exp.runtime.gateway.batch.BatchControlPlane``; the loose annotation
+        keeps the synchronous components importable without the batch package.
         """
         ...
 

@@ -196,53 +196,6 @@ class GatewayManagement:
             replace=replace,
         )
 
-    def configure_direct_alias(
-        self,
-        *,
-        alias_id: str,
-        alias_name: str,
-        revision_id: str,
-        pool_id: str,
-        snapshot_ref: str,
-        catalog_sha256: str,
-        provider_connections: dict[str, ConnectionConfig],
-        replace: bool,
-    ) -> None:
-        """Atomically revise serving connections and activate one direct alias revision.
-
-        Args:
-            alias_id: Stable public alias identifier.
-            alias_name: Public model string.
-            revision_id: Immutable alias revision identifier.
-            pool_id: Direct target pool identifier.
-            snapshot_ref: Content-addressed catalog snapshot reference.
-            catalog_sha256: Exact normalized catalog digest.
-            provider_connections: Desired secret-free SQLite-authoritative connection metadata.
-            replace: Whether differing active connection metadata may be revised.
-
-        Raises:
-            GatewayStoreError: The requested authority violates an existing invariant.
-        """
-        mutations = tuple(
-            ProviderConnectionMutation(
-                connection_id=connection_id,
-                revision_id=provider_connection_revision_id(connection_id, config),
-                config=config.canonicalized(),
-            )
-            for connection_id, config in sorted(provider_connections.items())
-        )
-        self.require_initialized().upsert_provider_connections_and_activate_direct_alias(
-            organization_id=self.organization_id,
-            alias_id=alias_id,
-            alias_name=alias_name,
-            revision_id=revision_id,
-            pool_id=pool_id,
-            snapshot_ref=snapshot_ref,
-            catalog_sha256=catalog_sha256,
-            provider_connections=mutations,
-            replace=replace,
-        )
-
     def configure_direct_alias_with_identity(
         self,
         *,
@@ -590,6 +543,56 @@ class GatewayManagement:
                     None if row["catalog_sha256"] is None else str(row["catalog_sha256"])
                 ),
                 refusal_failover=bool(row["refusal_failover"]),
+            )
+            for row in rows
+        )
+
+    def prior_alias_revisions(
+        self, alias: GatewayAliasView, *, limit: int
+    ) -> tuple[GatewayAliasView, ...]:
+        """Return an alias's non-active revisions, newest first, as servable views.
+
+        Used only as a last-good fallback: when an alias's active revision pins an
+        unservable snapshot, the pod walks these newest-first to serve the most
+        recent prior revision whose snapshot is present and valid. Each view keeps
+        the alias identity but carries that prior revision's pinned target and
+        snapshot, so serving and attribution follow the revision actually served.
+
+        Args:
+            alias: The active alias view whose pinned revision is unservable.
+            limit: Maximum number of prior revisions to return (bounds the walk).
+
+        Returns:
+            Prior revision views ordered newest revision first, excluding the
+            active revision; empty when the alias has no prior revisions.
+        """
+        if not self.initialized or alias.revision_id is None:
+            return ()
+        rows = self._rows(
+            f"""
+            SELECT r.revision_id, r.target_kind, r.pool_id, r.project_ref,
+                   r.activation_ref, r.snapshot_ref, r.catalog_sha256, r.refusal_failover
+            FROM alias_revisions AS r
+            WHERE r.organization_id = ? AND r.alias_id = ? AND r.revision_id != ?
+            ORDER BY r.revision_number DESC
+            LIMIT {int(limit)}
+            """,
+            (self.organization_id, alias.alias_id, alias.revision_id),
+        )
+        return tuple(
+            alias.model_copy(
+                update={
+                    "revision_id": str(row["revision_id"]),
+                    "target_kind": str(row["target_kind"]),
+                    "pool_id": None if row["pool_id"] is None else str(row["pool_id"]),
+                    "project_ref": None if row["project_ref"] is None else str(row["project_ref"]),
+                    "activation_ref": (
+                        None if row["activation_ref"] is None else str(row["activation_ref"])
+                    ),
+                    "snapshot_ref": str(row["snapshot_ref"]),
+                    "catalog_sha256": str(row["catalog_sha256"]),
+                    "refusal_failover": bool(row["refusal_failover"]),
+                }
             )
             for row in rows
         )

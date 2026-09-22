@@ -11,13 +11,24 @@ use crate::events::{
     CompletedToolCall, Event, ProviderAssistantMessagePhase, ProviderOutputItemKind,
     ProviderOutputItemStatus, Usage,
 };
+use crate::tool_search::ResponsesToolSearch;
+use crate::web_search::{url_citations, CitationShape, WebSearchAdmission};
 
 mod aggregate;
+mod close;
 mod envelope;
 mod output;
 mod provider;
 
-pub use aggregate::{completed_responses_body, completed_responses_body_with_carrier};
+// `completed_responses_body_with_carrier` stays on the public seam for the
+// unit tests and any host that never runs a search; the routes now call the
+// web-search-aware variant.
+#[allow(unused_imports)]
+pub use aggregate::{
+    completed_responses_body, completed_responses_body_with_carrier,
+    completed_responses_body_with_gateway_tools, completed_responses_body_with_web_search,
+    AggregatedResponses,
+};
 pub use envelope::ResponsesEnvelope;
 
 fn invalid_provider_stream(message: &str) -> PublicError {
@@ -29,111 +40,9 @@ fn invalid_provider_stream(message: &str) -> PublicError {
 mod tool_state;
 use tool_state::ToolState;
 
-/// One accumulated reasoning item with provider-indexed summary parts and
-/// an optional opaque encrypted payload the caller replays verbatim.
-struct ReasoningState {
-    item_id: String,
-    output_index: usize,
-    parts: BTreeMap<u32, String>,
-    encrypted_content: Option<String>,
-    status: Option<ProviderOutputItemStatus>,
-    done: bool,
-}
-
-impl ReasoningState {
-    fn item(
-        &self,
-        include_content: bool,
-        fallback_status: ProviderOutputItemStatus,
-        include_encrypted_content: bool,
-    ) -> Value {
-        let summary: Vec<Value> = if include_content {
-            self.parts
-                .values()
-                .map(|text| json!({"type": "summary_text", "text": text}))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let mut item = json!({
-            "id": self.item_id,
-            "type": "reasoning",
-            "summary": summary,
-            "status": self.status.unwrap_or(fallback_status).as_str(),
-        });
-        if include_encrypted_content {
-            if let Some(encrypted) = &self.encrypted_content {
-                item.as_object_mut()
-                    .expect("reasoning item is an object")
-                    .insert("encrypted_content".to_string(), json!(encrypted));
-            }
-        }
-        item
-    }
-}
-
-/// Provider-owned output item reserved before its content-bearing event.
-struct ProviderOutputStart {
-    item_id: Option<String>,
-    kind: ProviderOutputItemKind,
-    output_index: usize,
-    status: Option<ProviderOutputItemStatus>,
-    phase: Option<ProviderAssistantMessagePhase>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum MessageKey {
-    Synthetic,
-    Provider(u32),
-}
-
-/// One independently addressable assistant message output item.
-struct MessageState {
-    item_id: String,
-    output_index: usize,
-    status: Option<ProviderOutputItemStatus>,
-    phase: Option<ProviderAssistantMessagePhase>,
-    text: String,
-    refusal: String,
-    text_started: bool,
-    refusal_started: bool,
-    done: bool,
-}
-
-impl MessageState {
-    fn item(&self, include_content: bool, fallback_status: ProviderOutputItemStatus) -> Value {
-        let mut content = Vec::new();
-        if include_content && self.text_started {
-            content.push(json!({
-                "type": "output_text",
-                "text": self.text,
-                "annotations": [],
-            }));
-        }
-        if include_content && self.refusal_started {
-            content.push(json!({"type": "refusal", "refusal": self.refusal}));
-        }
-        let mut item = json!({
-            "id": self.item_id,
-            "type": "message",
-            "role": "assistant",
-            "status": self.status.unwrap_or(fallback_status).as_str(),
-            "content": content,
-        });
-        if let Some(phase) = self.phase {
-            item["phase"] = json!(phase.as_str());
-        }
-        item
-    }
-}
-
-#[derive(Clone, Copy)]
-enum OutputSlot {
-    Message(MessageKey),
-    Tool(u32),
-    Reasoning(u32),
-    FireworksReasoning,
-}
+#[path = "encode_responses/state.rs"]
+mod state;
+use state::*;
 
 /// Incremental Responses lifecycle encoder with one monotonic terminal event,
 /// emitting byte-identical frames to the Python `ResponsesSseEncoder`.
@@ -141,7 +50,7 @@ pub struct ResponsesSseEncoder {
     response_id: String,
     synthetic_message_id: String,
     model: String,
-    created_at: f64,
+    created_at: i64,
     envelope: ResponsesEnvelope,
     started: bool,
     terminal: bool,
@@ -149,19 +58,24 @@ pub struct ResponsesSseEncoder {
     output_order: Vec<OutputSlot>,
     tools: HashMap<u32, ToolState>,
     reasoning: HashMap<u32, ReasoningState>,
+    hosted: HashMap<u32, HostedToolState>,
     fireworks_reasoning: Option<ReasoningState>,
     fireworks_reasoning_route_sha256: Option<String>,
     reasoning_content_carrier: Option<String>,
     messages: HashMap<MessageKey, MessageState>,
     provider_output_starts: HashMap<u32, ProviderOutputStart>,
     usage: Option<Usage>,
+    web_search: Option<WebSearchAdmission>,
+    /// The gateway-run tool-search rounds, rendered as leading hosted items
+    /// at `start` and metered on usage; `None` changes nothing.
+    tool_search: Option<ResponsesToolSearch>,
 }
 
 impl ResponsesSseEncoder {
     pub fn new(
         request_id: &str,
         model: &str,
-        created_at: f64,
+        created_at: i64,
         envelope: ResponsesEnvelope,
     ) -> Self {
         Self {
@@ -176,13 +90,36 @@ impl ResponsesSseEncoder {
             output_order: Vec::new(),
             tools: HashMap::new(),
             reasoning: HashMap::new(),
+            hosted: HashMap::new(),
             fireworks_reasoning: None,
             fireworks_reasoning_route_sha256: None,
             reasoning_content_carrier: None,
             messages: HashMap::new(),
             provider_output_starts: HashMap::new(),
             usage: None,
+            web_search: None,
+            tool_search: None,
         }
+    }
+
+    /// Render the gateway-run tool-search rounds as `tool_search_call` /
+    /// `tool_search_output` items ahead of every provider item (see
+    /// `tool_search::responses_tool_search`); set before `start`.
+    pub fn set_tool_search(&mut self, tool_search: Option<ResponsesToolSearch>) {
+        self.tool_search = tool_search;
+    }
+
+    /// How many tool-search rounds this response meters.
+    pub(super) fn tool_search_requests(&self) -> u32 {
+        self.tool_search
+            .as_ref()
+            .map_or(0, |search| search.requests)
+    }
+
+    /// Cite the gateway-executed web search on the synthetic message and
+    /// meter it on usage: `None` (no search) leaves every frame untouched.
+    pub fn set_web_search(&mut self, web_search: Option<WebSearchAdmission>) {
+        self.web_search = web_search;
     }
 
     /// Emit required created and in-progress lifecycle events once.
@@ -201,7 +138,19 @@ impl ResponsesSseEncoder {
             "response.in_progress",
             json!({"response": self.response("in_progress", None)}),
         );
-        Ok(vec![created, in_progress])
+        let mut frames = vec![created, in_progress];
+        // The gateway's own search items lead the output, exactly where a
+        // native rung would stream its hosted tool calls.
+        if let Some(events) = self
+            .tool_search
+            .as_ref()
+            .map(|search| search.events.clone())
+        {
+            for event in &events {
+                frames.extend(self.feed(event)?);
+            }
+        }
+        Ok(frames)
     }
 
     /// Encode one ordered normalized event into Responses lifecycle frames.
@@ -293,19 +242,59 @@ impl ResponsesSseEncoder {
                 encrypted_content,
             } => self.encrypted_reasoning(*output_index, item_id, encrypted_content),
             Event::ToolCallStarted {
+                custom,
                 index,
                 call_id,
                 name,
-            } => self.tool_started(*index, call_id, name),
+                namespace,
+                caller,
+            } => self.tool_started(
+                *index,
+                call_id,
+                name,
+                namespace.as_deref(),
+                caller.as_ref(),
+                *custom,
+            ),
             Event::ToolArgumentsDelta { index, delta } => self.tool_arguments(*index, delta),
             Event::ToolCallCompleted { index, call } => self.tool_completed(*index, call),
+            // Anthropic text-block boundaries and citation metadata have no
+            // Responses representation; the text itself streams as deltas.
+            Event::TextBlockStarted { .. } | Event::CitationDelta { .. } => Ok(Vec::new()),
+            // Server tools enter only through a Messages request, which
+            // never encodes on the Responses surface.
+            Event::ServerToolUseStarted { .. }
+            | Event::ServerToolArgumentsDelta { .. }
+            | Event::ServerToolUseCompleted { .. }
+            | Event::ServerToolResult { .. } => Err(invalid_provider_stream(
+                "Responses cannot represent a provider server tool.",
+            )),
+            Event::HostedToolItemStarted {
+                output_index, item, ..
+            } => self.hosted_started(*output_index, item),
+            Event::HostedToolItemProgress {
+                output_index,
+                event_type,
+                payload,
+                ..
+            } => self.hosted_progress(*output_index, event_type, payload),
+            Event::HostedToolItemCompleted {
+                output_index, item, ..
+            } => self.hosted_completed(*output_index, item),
+            Event::ProviderTextAnnotation {
+                output_index,
+                item_id,
+                annotation,
+            } => self.text_annotation(*output_index, item_id, annotation),
             Event::Usage(usage) => {
                 if usage.has_token_counts() {
                     self.usage = Some(usage.clone());
                 }
                 Ok(Vec::new())
             }
-            Event::Completed => self.finish("completed", None),
+            Event::Completed | Event::StoppedAtSequence(_) | Event::PausedTurn => {
+                self.finish("completed", None)
+            }
             Event::Incomplete => self.finish("incomplete", None),
             Event::Failed(failure) => self.finish("failed", Some(failure)),
         }
@@ -445,6 +434,7 @@ impl ResponsesSseEncoder {
             phase: None,
             text: String::new(),
             refusal: String::new(),
+            annotations: Vec::new(),
             text_started: false,
             refusal_started: false,
             done: false,
@@ -556,6 +546,9 @@ impl ResponsesSseEncoder {
         index: u32,
         call_id: &str,
         name: &str,
+        namespace: Option<&str>,
+        caller: Option<&Value>,
+        custom: bool,
     ) -> Result<Vec<String>, PublicError> {
         if self.tools.contains_key(&index) {
             return Err(invalid_provider_stream(
@@ -590,15 +583,18 @@ impl ResponsesSseEncoder {
                 false,
             ),
         };
-        let custom = self
-            .provider_output_starts
-            .get(&index)
-            .is_some_and(|start| start.kind == ProviderOutputItemKind::CustomToolCall);
+        let custom = custom
+            || self
+                .provider_output_starts
+                .get(&index)
+                .is_some_and(|start| start.kind == ProviderOutputItemKind::CustomToolCall);
         let state = ToolState {
             item_id,
             output_index,
             call_id: call_id.to_string(),
             name: name.to_string(),
+            namespace: namespace.map(str::to_string),
+            caller: caller.cloned(),
             arguments: String::new(),
             status,
             done: false,
@@ -654,6 +650,9 @@ impl ResponsesSseEncoder {
         let state = self.open_tool(index)?;
         if state.call_id != call.call_id
             || state.name != call.name
+            || state.namespace != call.namespace
+            || state.caller != call.caller
+            || state.custom != call.custom
             || state.arguments != call.raw_arguments
             || (provider_owned_identity && call.provider_item_id != state.item_id)
         {
@@ -784,10 +783,16 @@ impl ResponsesSseEncoder {
                     };
                     frames.extend(self.close_reasoning(index, item_status));
                 }
+                OutputSlot::HostedTool(index) if !self.hosted[&index].done => {
+                    frames.extend(self.close_hosted(index));
+                }
                 OutputSlot::FireworksReasoning => {
                     frames.extend(self.close_fireworks_reasoning(fallback_status));
                 }
-                OutputSlot::Message(_) | OutputSlot::Tool(_) | OutputSlot::Reasoning(_) => {}
+                OutputSlot::Message(_)
+                | OutputSlot::Tool(_)
+                | OutputSlot::Reasoning(_)
+                | OutputSlot::HostedTool(_) => {}
             }
         }
         self.terminal = true;
@@ -881,93 +886,6 @@ impl ResponsesSseEncoder {
         frames.push(self.event(
             "response.output_item.done",
             json!({"output_index": output_index, "item": item}),
-        ));
-        frames
-    }
-
-    /// Emit content and output completion for one assistant message.
-    fn close_message(
-        &mut self,
-        key: MessageKey,
-        fallback_status: ProviderOutputItemStatus,
-    ) -> Vec<String> {
-        let (item_id, output_index, text, refusal, text_started, refusal_started, item) = {
-            let state = match self.messages.get_mut(&key) {
-                Some(state) => state,
-                None => return Vec::new(),
-            };
-            if state.done {
-                return Vec::new();
-            }
-            state.done = true;
-            if matches!(
-                state.status,
-                None | Some(ProviderOutputItemStatus::InProgress)
-            ) {
-                state.status = Some(fallback_status);
-            }
-            (
-                state.item_id.clone(),
-                state.output_index,
-                state.text.clone(),
-                state.refusal.clone(),
-                state.text_started,
-                state.refusal_started,
-                state.item(true, fallback_status),
-            )
-        };
-        let mut frames: Vec<String> = Vec::new();
-        let mut content_index = 0;
-        if text_started {
-            frames.push(self.event(
-                "response.output_text.done",
-                json!({
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": content_index,
-                    "text": text,
-                    "logprobs": [],
-                }),
-            ));
-            let part = json!({"type": "output_text", "text": text, "annotations": []});
-            frames.push(self.event(
-                "response.content_part.done",
-                json!({
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": content_index,
-                    "part": part,
-                }),
-            ));
-            content_index += 1;
-        }
-        if refusal_started {
-            frames.push(self.event(
-                "response.refusal.done",
-                json!({
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": content_index,
-                    "refusal": refusal,
-                }),
-            ));
-            let part = json!({"type": "refusal", "refusal": refusal});
-            frames.push(self.event(
-                "response.content_part.done",
-                json!({
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": content_index,
-                    "part": part,
-                }),
-            ));
-        }
-        frames.push(self.event(
-            "response.output_item.done",
-            json!({
-                "output_index": output_index,
-                "item": item,
-            }),
         ));
         frames
     }

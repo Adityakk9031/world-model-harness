@@ -17,6 +17,14 @@ from exp.common.models import (
     ModelSnapshot,
 )
 from exp.common.models.catalog import GatewayDeploymentCapabilities
+from exp.common.models.content import (
+    AudioContentPart,
+    DocumentContentPart,
+    ImageContentPart,
+    MediaHandle,
+    TextContentPart,
+    VideoContentPart,
+)
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -31,6 +39,8 @@ from exp.runtime.models.providers.errors import (
 from exp.runtime.models.providers.protocol import (
     BoundedSyncModelClientAdapter,
     SyncModelClientAdapter,
+    emulated_gateway_capabilities,
+    emulated_stop_sequences,
     preflight_gateway_request,
     require_gateway_provider,
 )
@@ -251,9 +261,311 @@ def test_preflight_rejects_over_limit_stop_list_with_a_named_parameter_error() -
     preflight_gateway_request(request, GatewayDeploymentCapabilities(supports_stop_sequences=True))
 
 
+def test_preflight_admits_an_undeclared_stop_when_the_data_plane_emulates_it() -> None:
+    """A Responses rung has no stop field, yet admits stop: the gateway cuts the stream itself."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        stop=("</severity>",),
+    )
+    undeclared = GatewayDeploymentCapabilities(supports_stop_sequences=False)
+
+    with pytest.raises(ProviderCapabilityError) as caught:
+        preflight_gateway_request(request, undeclared)
+    assert caught.value.capability == "stop_sequences"
+
+    assert emulated_gateway_capabilities("openai_responses") == frozenset({"stop_sequences"})
+    assert emulated_gateway_capabilities("openai_compatible") == frozenset()
+    # parallel_tool_calls emulation is opt-in: admission's last resort on any wire.
+    assert emulated_gateway_capabilities(
+        "openai_compatible", emulate_parallel_tool_calls=True
+    ) == frozenset({"parallel_tool_calls"})
+    preflight_gateway_request(
+        request,
+        undeclared,
+        emulated_capabilities=emulated_gateway_capabilities("openai_responses"),
+    )
+    # Emulation is per capability: an unrelated undeclared feature still rejects.
+    with pytest.raises(ProviderCapabilityError):
+        preflight_gateway_request(
+            request.model_copy(update={"stream": True}),
+            undeclared,
+            public_stream=True,
+            emulated_capabilities=emulated_gateway_capabilities("openai_responses"),
+        )
+
+
+def test_emulated_stop_sequences_follow_the_dialect_and_the_request() -> None:
+    """Only a Responses rung hands the caller's sequences to the data plane."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        stop=("</block>", "DONE"),
+    )
+    assert emulated_stop_sequences("openai_responses", request) == ("</block>", "DONE")
+    assert emulated_stop_sequences("anthropic_messages", request) == ()
+    assert (
+        emulated_stop_sequences("openai_responses", request.model_copy(update={"stop": ()})) == ()
+    )
+
+
 def test_tinker_is_explicitly_excluded_from_gateway_execution() -> None:
     """Tinker remains optimizer-only until it has a cancellable stream contract."""
     with pytest.raises(ProviderCapabilityError, match="tinker_gateway_execution"):
         require_gateway_provider("tinker")
 
     require_gateway_provider("openai")
+
+
+def _image_request() -> GatewayRequest:
+    """Build one caller request carrying an inline image beside its text."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="what is this",
+                content_parts=(
+                    TextContentPart(text="what is this"),
+                    ImageContentPart(
+                        media_type="image/png",
+                        data=(
+                            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+                            "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def test_preflight_rejects_an_image_on_a_route_that_does_not_declare_it() -> None:
+    """A picture is never dropped and answered from the surrounding text alone."""
+    with pytest.raises(ProviderCapabilityError, match="image_input"):
+        preflight_gateway_request(_image_request(), GatewayDeploymentCapabilities())
+
+
+def test_preflight_admits_an_inline_image_on_an_image_route() -> None:
+    """A declared image route serves inline bytes without declaring URL support."""
+    preflight_gateway_request(
+        _image_request(),
+        GatewayDeploymentCapabilities(supports_image_input=True),
+    )
+
+
+def test_preflight_rejects_an_image_url_on_an_inline_only_route() -> None:
+    """A remote URL needs its own declaration, so a waterfall can narrow to it."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="what is this",
+                content_parts=(
+                    TextContentPart(text="what is this"),
+                    ImageContentPart(url="https://example.com/cat.png"),
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(ProviderCapabilityError, match="image_url_input"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(supports_image_input=True),
+        )
+    preflight_gateway_request(
+        request,
+        GatewayDeploymentCapabilities(supports_image_input=True, supports_image_url_input=True),
+    )
+
+
+def _video_request(*, remote: bool = False) -> GatewayRequest:
+    """Build one caller request carrying a video beside its text."""
+    video = (
+        VideoContentPart(url="https://example.com/clip.mp4")
+        if remote
+        else VideoContentPart(media_type="video/mp4", data="AAAAIGZ0eXBpc29t")
+    )
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="what happens",
+                content_parts=(TextContentPart(text="what happens"), video),
+            ),
+        ),
+    )
+
+
+def test_preflight_rejects_a_video_on_a_route_that_does_not_declare_it() -> None:
+    """A video is never dropped and answered from the surrounding text alone."""
+    with pytest.raises(ProviderCapabilityError, match="video_input"):
+        preflight_gateway_request(_video_request(), GatewayDeploymentCapabilities())
+    with pytest.raises(ProviderCapabilityError, match="video_input"):
+        preflight_gateway_request(
+            _video_request(),
+            GatewayDeploymentCapabilities(supports_image_input=True, supports_image_url_input=True),
+        )
+
+
+def test_preflight_admits_an_inline_video_on_a_video_route() -> None:
+    """A declared video route serves inline bytes without declaring URL support."""
+    preflight_gateway_request(
+        _video_request(),
+        GatewayDeploymentCapabilities(supports_video_input=True),
+    )
+
+
+def test_preflight_rejects_a_video_url_on_an_inline_only_route() -> None:
+    """A remote video URL needs its own declaration, so a waterfall can narrow to it."""
+    with pytest.raises(ProviderCapabilityError, match="video_url_input"):
+        preflight_gateway_request(
+            _video_request(remote=True),
+            GatewayDeploymentCapabilities(supports_video_input=True),
+        )
+    preflight_gateway_request(
+        _video_request(remote=True),
+        GatewayDeploymentCapabilities(supports_video_input=True, supports_video_url_input=True),
+    )
+
+
+_PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+"""One short PDF header, base64 encoded."""
+
+
+def _document_request(document: DocumentContentPart) -> GatewayRequest:
+    """Build one caller request carrying a document beside its text."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="summarize this",
+                content_parts=(TextContentPart(text="summarize this"), document),
+            ),
+        ),
+    )
+
+
+def test_preflight_rejects_a_document_on_a_route_that_does_not_declare_it() -> None:
+    """A PDF is never dropped and answered from the surrounding text alone."""
+    request = _document_request(DocumentContentPart(data=_PDF_BASE64))
+    with pytest.raises(ProviderCapabilityError, match="pdf_input"):
+        preflight_gateway_request(request, GatewayDeploymentCapabilities())
+    with pytest.raises(ProviderCapabilityError, match="pdf_input"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(supports_image_input=True, supports_image_url_input=True),
+        )
+
+
+def test_preflight_admits_an_inline_document_on_a_pdf_route() -> None:
+    """A declared PDF route serves inline bytes without declaring URL support."""
+    preflight_gateway_request(
+        _document_request(DocumentContentPart(data=_PDF_BASE64)),
+        GatewayDeploymentCapabilities(supports_pdf_input=True),
+    )
+
+
+def test_preflight_rejects_a_document_url_on_an_inline_only_route() -> None:
+    """A remote PDF URL needs its own declaration, so a waterfall can narrow to it."""
+    request = _document_request(DocumentContentPart(url="https://example.com/brief.pdf"))
+    with pytest.raises(ProviderCapabilityError, match="pdf_url_input"):
+        preflight_gateway_request(request, GatewayDeploymentCapabilities(supports_pdf_input=True))
+    preflight_gateway_request(
+        request,
+        GatewayDeploymentCapabilities(supports_pdf_input=True, supports_pdf_url_input=True),
+    )
+
+
+def _handle_request(handle: MediaHandle) -> GatewayRequest:
+    """Build one Chat request carrying a single image handle beside text."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="describe",
+                content_parts=(
+                    TextContentPart(text="describe"),
+                    ImageContentPart(handle=handle),
+                ),
+            ),
+        ),
+    )
+
+
+def test_preflight_refuses_a_handle_without_the_route_declaration() -> None:
+    """An image route that never declared handles refuses one before dispatch."""
+    request = _handle_request(MediaHandle(provider="openai", reference="file-abc"))
+    with pytest.raises(ProviderCapabilityError, match="media_handle_input"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(supports_image_input=True),
+            route_provider="openai",
+        )
+
+
+def test_preflight_refuses_a_handle_on_another_providers_route() -> None:
+    """A declared route still refuses a handle uploaded to a different provider."""
+    request = _handle_request(MediaHandle(provider="openai", reference="file-abc"))
+    capabilities = GatewayDeploymentCapabilities(
+        supports_image_input=True, supports_media_handle_input=True
+    )
+    with pytest.raises(ProviderCapabilityError, match="media_handle_provider") as error:
+        preflight_gateway_request(request, capabilities, route_provider="anthropic")
+    assert error.value.detail is not None and "uploaded to openai" in error.value.detail
+    with pytest.raises(ProviderCapabilityError, match="media_handle_provider"):
+        preflight_gateway_request(request, capabilities)
+    preflight_gateway_request(request, capabilities, route_provider="openai")
+
+
+def test_preflight_checks_the_media_kind_before_the_handle() -> None:
+    """A handle never bypasses the image, video, or PDF declaration."""
+    request = _handle_request(MediaHandle(provider="openai", reference="file-abc"))
+    with pytest.raises(ProviderCapabilityError, match="image_input"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(supports_media_handle_input=True),
+            route_provider="openai",
+        )
+
+
+def _audio_request() -> GatewayRequest:
+    """Build one caller request carrying a clip beside its text."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="what is said",
+                content_parts=(
+                    TextContentPart(text="what is said"),
+                    AudioContentPart(media_type="audio/wav", data="UklGRgAAAABXQVZF"),
+                ),
+            ),
+        ),
+    )
+
+
+def test_preflight_rejects_audio_on_a_route_that_does_not_declare_it() -> None:
+    """A clip is never dropped and answered from the surrounding text alone."""
+    with pytest.raises(ProviderCapabilityError, match="audio_input"):
+        preflight_gateway_request(_audio_request(), GatewayDeploymentCapabilities())
+    with pytest.raises(ProviderCapabilityError, match="audio_input"):
+        preflight_gateway_request(
+            _audio_request(),
+            GatewayDeploymentCapabilities(
+                supports_image_input=True, supports_video_input=True, supports_pdf_input=True
+            ),
+        )
+
+
+def test_preflight_admits_audio_on_a_declared_audio_route() -> None:
+    """A declared audio route serves the inline clip."""
+    preflight_gateway_request(
+        _audio_request(), GatewayDeploymentCapabilities(supports_audio_input=True)
+    )

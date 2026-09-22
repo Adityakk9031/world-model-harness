@@ -3,9 +3,35 @@
 
 use serde_json::{Map, Value};
 
-use super::{complete_streamed_tool, malformed, parse_object, refusal_failure, Normalizer};
+use super::{malformed, parse_object, Normalizer};
 use crate::errors::{Failure, FailureClass};
 use crate::events::{bedrock_usage, require_string, require_u64, Event, ToolAccumulator};
+
+/// The bounded single-line detail of one Bedrock exception frame.
+///
+/// Exception messages name the mechanism (model stream errors, service
+/// unavailability) that the typed class alone cannot; the detail is attached
+/// only to stream-failure classes that never relay `provider_detail` to
+/// callers, so it reaches the ledger without widening the caller-facing
+/// sanitization boundary.
+fn bedrock_exception_detail(frame: &crate::sse::SseEvent) -> Option<String> {
+    let message = serde_json::from_str::<Value>(&frame.data)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let detail = super::provider_error_detail(None, message.as_deref(), &[]);
+    if let Some(detail) = &detail {
+        // The same structured operator line the other dialects emit, so a
+        // Bedrock-declared failure is equally visible in the immediate
+        // diagnostic stream.
+        super::log_provider_declared_failure("bedrock_converse_stream", detail);
+    }
+    detail
+}
 
 impl Normalizer {
     /// Normalize one Bedrock ConverseStream frame, mirroring the python
@@ -32,25 +58,28 @@ impl Normalizer {
                 Ok(Vec::new())
             }
             "metadata" => self.bedrock_metadata(frame),
-            "throttlingException" => Ok(vec![Event::Failed(Failure::new(
-                FailureClass::Throttled,
-                "provider throttled the request",
-            ))]),
-            "modelTimeoutException" => Ok(vec![Event::Failed(Failure::new(
-                FailureClass::Timeout,
-                "provider request timed out",
-            ))]),
+            "throttlingException" => Ok(vec![Event::Failed(
+                Failure::new(FailureClass::Throttled, "provider throttled the request")
+                    .with_provider_detail(bedrock_exception_detail(frame)),
+            )]),
+            "modelTimeoutException" => Ok(vec![Event::Failed(
+                Failure::new(FailureClass::Timeout, "provider request timed out")
+                    .with_provider_detail(bedrock_exception_detail(frame)),
+            )]),
             "internalServerException"
             | "modelStreamErrorException"
-            | "serviceUnavailableException" => Ok(vec![Event::Failed(Failure::new(
-                FailureClass::ProviderInternal,
-                "provider stream failed",
-            ))]),
+            | "serviceUnavailableException" => Ok(vec![Event::Failed(
+                Failure::new(FailureClass::ProviderInternal, "provider stream failed")
+                    .with_provider_detail(bedrock_exception_detail(frame)),
+            )]),
             "validationException" => Ok(vec![Event::Failed(Failure::new(
                 FailureClass::InvalidRequest,
                 "provider rejected the request",
             ))]),
-            _ => Err(malformed("Bedrock stream emitted an unsupported event")),
+            other => Err(malformed(&format!(
+                "Bedrock stream emitted an unsupported event (type {})",
+                super::bounded_wire_token(other),
+            ))),
         }
     }
 
@@ -73,10 +102,13 @@ impl Normalizer {
         };
         let raw_tool = match start.get("toolUse") {
             None | Some(Value::Null) => {
-                if start.is_empty() {
+                if start.is_empty() || start.contains_key("reasoningContent") {
                     return Ok(Vec::new());
                 }
-                return Err(malformed("Bedrock content block start is unsupported"));
+                return Err(malformed(&format!(
+                    "Bedrock content block start is unsupported (key {})",
+                    super::bounded_wire_token(start.keys().next().map_or("", String::as_str)),
+                )));
             }
             Some(value) => value,
         };
@@ -94,9 +126,12 @@ impl Normalizer {
         self.tools
             .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
         Ok(vec![Event::ToolCallStarted {
+            custom: false,
             index,
             call_id,
             name,
+            namespace: None,
+            caller: None,
         }])
     }
 
@@ -120,7 +155,18 @@ impl Normalizer {
         }
         let raw_tool = match delta.get("toolUse") {
             None | Some(Value::Null) => {
-                return Err(malformed("Bedrock content block delta is unsupported"))
+                // A reasoning model streams its thinking as its own indexed
+                // block ahead of the answer text. The canonical event stream
+                // carries answer text and tool calls, so the thinking block
+                // and its deltas are accepted and dropped instead of failing
+                // the stream.
+                if delta.contains_key("reasoningContent") {
+                    return Ok(Vec::new());
+                }
+                return Err(malformed(&format!(
+                    "Bedrock content block delta is unsupported (key {})",
+                    super::bounded_wire_token(delta.keys().next().map_or("", String::as_str)),
+                )));
             }
             Some(value) => value,
         };
@@ -158,7 +204,13 @@ impl Normalizer {
             return Ok(Vec::new());
         };
         let mut events = Vec::new();
-        complete_streamed_tool(index, &mut tool, &mut events)?;
+        // The stop reason arrives in the following messageStop, so a fragment
+        // left open by the output budget cannot be told from garbage yet.
+        self.complete_tool_deferring_failure(index, &mut tool, &mut events);
+        if !tool.completed {
+            self.bedrock_empty_stopped_tools.insert(index);
+            self.tools.insert(index, tool);
+        }
         Ok(events)
     }
 
@@ -168,13 +220,47 @@ impl Normalizer {
         let usage = bedrock_usage(payload.get("usage")).map_err(|message| malformed(&message))?;
         let mut events = vec![Event::Usage(usage)];
         if let Some(reason) = self.stop_reason.take() {
-            events.push(self.bedrock_terminal(&reason));
+            let result = if matches!(
+                reason.as_str(),
+                "max_tokens" | "model_context_window_exceeded"
+            ) {
+                let result = super::finish_open_tools_truncated(&mut self.tools);
+                self.tools.clear();
+                result
+            } else {
+                self.bedrock_finish_empty_stopped_tools(&reason)
+            };
+            match result {
+                Ok(tool_events) => {
+                    events.extend(tool_events);
+                    events.push(self.bedrock_terminal(&reason));
+                }
+                Err(failure) => events.push(Event::Failed(failure)),
+            }
+        }
+        Ok(events)
+    }
+
+    /// Resolve only stopped, argument-free blocks after a normal final reason.
+    fn bedrock_finish_empty_stopped_tools(&mut self, reason: &str) -> Result<Vec<Event>, Failure> {
+        let mut events = Vec::new();
+        for index in std::mem::take(&mut self.bedrock_empty_stopped_tools) {
+            if let Some(mut tool) = self.tools.remove(&index) {
+                if matches!(reason, "end_turn" | "stop_sequence" | "tool_use") {
+                    super::complete_streamed_tool(index, &mut tool, &mut events)?;
+                }
+            }
         }
         Ok(events)
     }
 
     /// Map the retained Bedrock stop reason to one terminal gateway event.
     fn bedrock_terminal(&mut self, reason: &str) -> Event {
+        let truncated = matches!(reason, "max_tokens" | "model_context_window_exceeded");
+        if let Err(failure) = self.resolve_deferred_tool_failure(truncated) {
+            self.tools.clear();
+            return Event::Failed(failure);
+        }
         if !self.tools.is_empty() {
             self.tools.clear();
             return Event::Failed(Failure::new(
@@ -183,9 +269,15 @@ impl Normalizer {
             ));
         }
         match reason {
+            // A call cut mid-fragment under a non-truncating stop reason was
+            // dropped at its block stop; the turn is the provider's cut.
+            "end_turn" | "stop_sequence" | "tool_use" if self.dropped_cut_call => Event::Incomplete,
             "end_turn" | "stop_sequence" | "tool_use" => Event::Completed,
             "max_tokens" | "model_context_window_exceeded" => Event::Incomplete,
-            "content_filtered" | "guardrail_intervened" => Event::Failed(refusal_failure()),
+            // The Bedrock stop reason names the content verdict.
+            "content_filtered" | "guardrail_intervened" => Event::Failed(Failure::refusal(
+                crate::stream_errors::refusal_reason(Some(reason), None),
+            )),
             _ => Event::Failed(Failure::new(
                 FailureClass::ProviderInternal,
                 "provider ended the stream unexpectedly",
@@ -217,6 +309,78 @@ mod bedrock_tests {
             &[(":message-type", "exception"), (":exception-type", name)],
             br#"{"message":"redacted"}"#,
         )
+    }
+
+    #[test]
+    fn bedrock_empty_stopped_tool_waits_for_final_reason() {
+        for reason in [
+            "tool_use",
+            "end_turn",
+            "max_tokens",
+            "model_context_window_exceeded",
+        ] {
+            for block_stop in [true, false] {
+                if !block_stop && matches!(reason, "tool_use" | "end_turn") {
+                    continue;
+                }
+                let mut chunks = vec![event(
+                    "contentBlockStart",
+                    &json!({
+                        "contentBlockIndex": 0,
+                        "start": {"toolUse": {"toolUseId": "call-1", "name": "lookup"}},
+                    }),
+                )];
+                if block_stop {
+                    chunks.push(event("contentBlockStop", &json!({"contentBlockIndex": 0})));
+                }
+                let mut decoder = super::super::FrameDecoder::new(Dialect::BedrockConverseStream);
+                let mut normalizer = Normalizer::new(Dialect::BedrockConverseStream);
+                for chunk in &chunks {
+                    for frame in decoder.feed(chunk).unwrap() {
+                        let events = normalizer.feed(&frame).unwrap();
+                        assert!(
+                            !events.iter().any(|event| matches!(
+                                event,
+                                Event::ToolCallCompleted { .. } | Event::ToolArgumentsDelta { .. }
+                            )),
+                            "block stop does not authorize an empty-object seed"
+                        );
+                    }
+                }
+                chunks.push(event("messageStop", &json!({"stopReason": reason})));
+                chunks.push(event(
+                    "metadata",
+                    &json!({"usage": {"inputTokens": 5, "outputTokens": 7, "totalTokens": 12}}),
+                ));
+                let (events, failure) = run_stream(&chunks);
+                assert!(failure.is_none(), "{failure:?}");
+                let truncated = matches!(reason, "max_tokens" | "model_context_window_exceeded");
+                assert_eq!(
+                    events.last().unwrap()["kind"],
+                    if truncated { "incomplete" } else { "completed" }
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["kind"] == "tool_call_completed")
+                        .count(),
+                    usize::from(!truncated)
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["kind"] == "tool_arguments_delta")
+                        .count(),
+                    usize::from(!truncated)
+                );
+                if !truncated {
+                    assert!(events
+                        .iter()
+                        .any(|event| event["kind"] == "tool_call_completed"
+                            && event["raw_arguments"] == "{}"));
+                }
+            }
+        }
     }
 
     #[test]
@@ -292,6 +456,61 @@ mod bedrock_tests {
                     "input_tokens": 12,
                     "output_tokens": 4,
                     "cached_input_tokens": 2,
+                    "cache_creation_input_tokens": 1,
+                    "reasoning_tokens": null,
+                }),
+                json!({"kind": "completed"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn bedrock_reasoning_blocks_stream_without_failing_the_answer() {
+        // A reasoning model leads its turn with an indexed thinking block; only
+        // the answer text reaches the canonical stream.
+        let chunks = vec![
+            event("messageStart", &json!({"role": "assistant"})),
+            event(
+                "contentBlockStart",
+                &json!({"contentBlockIndex": 0, "start": {"reasoningContent": {}}}),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"text": "a circle"}},
+                }),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"signature": "sig"}},
+                }),
+            ),
+            event("contentBlockStop", &json!({"contentBlockIndex": 0})),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 1, "delta": {"text": "Circle"}}),
+            ),
+            event("contentBlockStop", &json!({"contentBlockIndex": 1})),
+            event("messageStop", &json!({"stopReason": "end_turn"})),
+            event(
+                "metadata",
+                &json!({"usage": {"inputTokens": 9, "outputTokens": 4}}),
+            ),
+        ];
+        let (events, failure) = run_stream(&chunks);
+        assert!(failure.is_none());
+        assert_eq!(
+            events,
+            vec![
+                json!({"kind": "text_delta", "text": "Circle"}),
+                json!({
+                    "kind": "usage",
+                    "input_tokens": 9,
+                    "output_tokens": 4,
+                    "cached_input_tokens": 0,
                     "reasoning_tokens": null,
                 }),
                 json!({"kind": "completed"}),
@@ -314,7 +533,8 @@ mod bedrock_tests {
                 json!({
                     "kind": "failed",
                     "failure_class": "refusal",
-                    "safe_message": "provider refused the request",
+                    "safe_message": "provider refused the request: content policy",
+                    "refusal_reason": "content_policy",
                 }),
             ),
             (
@@ -322,7 +542,8 @@ mod bedrock_tests {
                 json!({
                     "kind": "failed",
                     "failure_class": "refusal",
-                    "safe_message": "provider refused the request",
+                    "safe_message": "provider refused the request: content policy",
+                    "refusal_reason": "content_policy",
                 }),
             ),
             (
@@ -389,6 +610,67 @@ mod bedrock_tests {
         assert_eq!(events[1]["kind"], "usage");
         assert_eq!(events[2]["kind"], "failed");
         assert_eq!(events[2]["failure_class"], "malformed_response");
+    }
+
+    #[test]
+    fn bedrock_tool_fragment_at_the_output_budget_is_incomplete_not_malformed() {
+        let fragment = |stop_reason: &str| tool_stream(stop_reason, "{\"city\": \"Par");
+        let (events, failure) = run_stream(&fragment("max_tokens"));
+        assert!(failure.is_none());
+        assert!(!events
+            .iter()
+            .any(|event| event["kind"] == "tool_call_completed"));
+        assert_eq!(
+            events.last().map(|event| event["kind"].clone()),
+            Some(json!("incomplete"))
+        );
+
+        // Bedrock's DeepSeek and Qwen shims close the block on an open
+        // fragment and report `tool_use`/`end_turn` (production 2026-09-09..15,
+        // 33 attempts): the stop reason misreports the cut, so the call is
+        // dropped and the turn settles Incomplete, never a 502.
+        for stop_reason in ["end_turn", "tool_use"] {
+            let (events, failure) = run_stream(&fragment(stop_reason));
+            assert!(failure.is_none());
+            assert!(!events
+                .iter()
+                .any(|event| event["kind"] == "tool_call_completed"));
+            assert_eq!(
+                events.last().map(|event| event["kind"].clone()),
+                Some(json!("incomplete")),
+                "{stop_reason}: {events:?}"
+            );
+        }
+
+        // A syntax error INSIDE the arguments is corruption, not a cut, and a
+        // non-truncating stop reason still surfaces it.
+        let (events, failure) = run_stream(&tool_stream("end_turn", "{\"city\": }"));
+        assert!(failure.is_none());
+        let last = events.last().expect("terminal");
+        assert_eq!(last["kind"], "failed");
+        assert_eq!(last["failure_class"], "malformed_response");
+    }
+
+    fn tool_stream(stop_reason: &str, input: &str) -> Vec<Vec<u8>> {
+        vec![
+            event(
+                "contentBlockStart",
+                &json!({
+                    "contentBlockIndex": 0,
+                    "start": {"toolUse": {"toolUseId": "call-1", "name": "lookup"}},
+                }),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 0, "delta": {"toolUse": {"input": input}}}),
+            ),
+            event("contentBlockStop", &json!({"contentBlockIndex": 0})),
+            event("messageStop", &json!({"stopReason": stop_reason})),
+            event(
+                "metadata",
+                &json!({"usage": {"inputTokens": 1, "outputTokens": 1}}),
+            ),
+        ]
     }
 
     #[test]

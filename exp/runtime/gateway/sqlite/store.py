@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import assert_never
 
 from exp.common.core.artifacts import Sha256, sha256_json
 from exp.runtime.gateway.auth import (
@@ -28,9 +29,12 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayTarget,
     ProjectTarget,
-    canonical_request_sha256,
 )
+from exp.runtime.gateway.decisions_contracts import DecisionRequest
+from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
+from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.interfaces import GatewayClock
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.sqlite import key_delivery
 from exp.runtime.gateway.sqlite.alias_activation import (
     activate_alias_revision_in_transaction,
@@ -44,7 +48,6 @@ from exp.runtime.gateway.sqlite.provider_authority import (
 from exp.runtime.gateway.sqlite.provider_store import ProviderConnectionStoreMixin
 from exp.runtime.gateway.sqlite.setup_authority import (
     configure_direct_alias_with_identity,
-    upsert_provider_connections_and_activate_direct_alias,
 )
 
 _LAST_USED_REFRESH_SECONDS = 60.0
@@ -56,6 +59,10 @@ class GatewayStoreError(ValueError):
 
 class InvalidVirtualKeyError(GatewayStoreError):
     """A virtual key is unknown, expired, revoked, or attached to disabled authority."""
+
+
+class ZdrRoutingUnavailableError(GatewayStoreError):
+    """A request demanded zero-data-retention routing this gateway cannot judge."""
 
 
 class AliasNotGrantedError(GatewayStoreError):
@@ -503,36 +510,6 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 store_error=GatewayStoreError,
             )
 
-    def upsert_provider_connections_and_activate_direct_alias(
-        self,
-        *,
-        organization_id: str,
-        alias_id: str,
-        alias_name: str,
-        revision_id: str,
-        pool_id: str,
-        snapshot_ref: str,
-        catalog_sha256: Sha256,
-        provider_connections: tuple[ProviderConnectionMutation, ...],
-        replace: bool,
-        refusal_failover: bool = False,
-    ) -> None:
-        """Atomically revise providers, register a snapshot, and activate one direct alias."""
-        upsert_provider_connections_and_activate_direct_alias(
-            self,
-            organization_id=organization_id,
-            alias_id=alias_id,
-            alias_name=alias_name,
-            revision_id=revision_id,
-            pool_id=pool_id,
-            snapshot_ref=snapshot_ref,
-            catalog_sha256=catalog_sha256,
-            provider_connections=provider_connections,
-            replace=replace,
-            refusal_failover=refusal_failover,
-            activate_alias_revision=activate_alias_revision_in_transaction,
-        )
-
     def configure_direct_alias_with_identity(
         self,
         *,
@@ -643,10 +620,11 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         *,
         raw_key: str,
         alias: str,
-        request: GatewayRequest,
+        request: ServingRequest,
         deadline_monotonic: float,
         app_referer: str | None = None,
         app_title: str | None = None,
+        client_ip: str | None = None,
     ) -> AuthorizationSnapshot:
         """Authenticate and authorize before any model or provider work.
 
@@ -656,6 +634,9 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             request: Canonical content-bearing request used only for its digest.
             deadline_monotonic: Absolute request-wide monotonic deadline.
             app_referer: Caller ``HTTP-Referer`` and ``app_title`` its ``X-Title`` app identity.
+            client_ip: Caller IP from the trusted proxy hop, frozen onto the snapshot
+                for the hosted authority's per-key IP enforcement; local SQLite serving
+                has no proxy, so it is simply carried through (usually ``None``).
 
         Returns:
             Immutable content-free authority snapshot.
@@ -700,7 +681,23 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 activation_ref=str(row["activation_ref"]),
                 catalog_sha256=str(row["catalog_sha256"]),
             )
-        caller_operation = _caller_operation_sha256(request)
+        match request:
+            case EmbeddingsRequest() | ImagesRequest() | DecisionRequest():
+                # These native surfaces carry no idempotency key and never
+                # claim a caller-operation scope.
+                caller_operation = None
+            case GatewayRequest():
+                caller_operation = _caller_operation_sha256(request)
+                if request.zdr_requested:
+                    # This gateway publishes no provider data-retention
+                    # postures, so a zero-data-retention demand cannot be
+                    # judged; refusing is the only honest answer.
+                    raise ZdrRoutingUnavailableError(
+                        "provider.zdr demands zero-data-retention routing, which this "
+                        "gateway cannot judge: it publishes no provider data-retention postures"
+                    )
+            case _:  # pragma: no cover - exhaustive over the ServingRequest union.
+                assert_never(request)
         return AuthorizationSnapshot(
             request_id=f"request-{uuid.uuid4().hex}",
             organization_id=organization_id,
@@ -717,6 +714,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             refusal_failover=bool(row["refusal_failover"]),
             app_referer=app_referer,
             app_title=app_title,
+            client_ip=client_ip,
         )
 
     def authenticate_key(self, *, raw_key: str) -> None:

@@ -188,10 +188,21 @@ class AnthropicClient(ProviderHttpClient):
         supports_top_p: bool = True,
         supports_top_k: bool = False,
         supports_logprobs: bool = False,
+        supports_frequency_penalty: bool = False,
+        supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
+        authorization_bearer: bool = False,
+        inference_geo: Literal["us"] | None = None,
     ) -> None:
-        """Create an Anthropic client with explicit generation capability gates."""
+        """Create an Anthropic client with explicit generation capability gates.
+
+        ``authorization_bearer`` sends the credential as ``Authorization: Bearer``
+        instead of ``x-api-key``. Anthropic's own API uses ``x-api-key``; Azure AI
+        Foundry serves the same native Messages API at ``{endpoint}/anthropic/v1``
+        but authenticates with a Bearer token, so a Foundry-hosted Claude routes
+        through this client with ``authorization_bearer=True``.
+        """
         super().__init__(
             model=model,
             api_key=api_key,
@@ -204,13 +215,22 @@ class AnthropicClient(ProviderHttpClient):
         self._supports_top_p = supports_top_p
         self._supports_top_k = supports_top_k
         self._supports_logprobs = supports_logprobs
+        self._supports_frequency_penalty = supports_frequency_penalty
+        self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
         self._reasoning_effort = reasoning_effort
+        self._authorization_bearer = authorization_bearer
+        self._inference_geo = inference_geo
 
     def _headers(self) -> dict[str, str]:
-        """Build native Anthropic Messages headers with the versioned API key scheme."""
+        """Build native Anthropic Messages headers with the connection's auth scheme."""
+        auth = (
+            {"Authorization": f"Bearer {self._api_key}"}
+            if self._authorization_bearer
+            else {"x-api-key": self._api_key}
+        )
         return {
-            "x-api-key": self._api_key,
+            **auth,
             "anthropic-version": ANTHROPIC_VERSION,
             "content-type": "application/json",
         }
@@ -219,6 +239,7 @@ class AnthropicClient(ProviderHttpClient):
         """Return the native Messages wire profile for this connection."""
         return GatewayWireProfile(
             dialect="anthropic_messages",
+            inference_geo=self._inference_geo,
             url=f"{self._base_url}/{self._request_path(self._completion_path())}",
             headers=self._headers(),
             model_id=self._model.model_id,
@@ -228,6 +249,8 @@ class AnthropicClient(ProviderHttpClient):
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
+            supports_frequency_penalty=self._supports_frequency_penalty,
+            supports_presence_penalty=self._supports_presence_penalty,
             supports_reasoning=self._supports_reasoning,
             reasoning_wire_format="anthropic_adaptive",
             reasoning_effort=self._reasoning_effort,
@@ -239,7 +262,7 @@ class AnthropicClient(ProviderHttpClient):
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a native Messages payload."""
-        return anthropic_messages_request(
+        payload = anthropic_messages_request(
             self._model.model_id,
             request,
             supports_temperature=self._supports_temperature,
@@ -248,6 +271,10 @@ class AnthropicClient(ProviderHttpClient):
             supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
         )
+
+        if self._inference_geo is not None:
+            payload["inference_geo"] = self._inference_geo
+        return payload
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one completed Messages payload into the shared response contract."""

@@ -1,11 +1,21 @@
 """Tests for the shared native Bedrock Converse payload builders."""
 
+import base64
 from typing import cast
+
+import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall, ToolChoice
+from exp.common.models.content import (
+    DocumentContentPart,
+    ImageContentPart,
+    TextContentPart,
+    VideoContentPart,
+)
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.bedrock_requests import converse_request
+from exp.runtime.models.providers.errors import ProviderParameterError
 
 
 def _tool_transcript_request() -> ModelRequest:
@@ -74,6 +84,31 @@ def test_converse_request_preserves_tool_ids_and_named_choice() -> None:
     assert result_payload["toolUseId"] == "call-old"
 
 
+def test_converse_request_carries_a_tool_result_image_inside_the_tool_result() -> None:
+    """A tool screenshot re-emits as a ``ToolResultContentBlock.image`` beside its text."""
+    request = _tool_transcript_request()
+    screenshot = ModelMessage(
+        role="tool",
+        tool_call_id="call-old",
+        content="created",
+        content_parts=(
+            TextContentPart(text="created"),
+            ImageContentPart(media_type="image/png", data="aGk="),
+        ),
+    )
+    request = request.model_copy(update={"messages": request.messages[:-1] + (screenshot,)})
+
+    payload = converse_request("us.anthropic.claude-sonnet-4-5", request)
+
+    messages = cast("list[JsonObject]", payload["messages"])
+    result = cast("JsonObject", cast("list[JsonObject]", messages[2]["content"])[0]["toolResult"])
+    assert result["toolUseId"] == "call-old"
+    assert result["content"] == [
+        {"text": "created"},
+        {"image": {"format": "png", "source": {"bytes": "aGk="}}},
+    ]
+
+
 def test_converse_request_gates_top_p_and_model_specific_top_k() -> None:
     """Bedrock keeps top-p standard and puts certified top-k in the model extension map."""
     request = _tool_transcript_request().model_copy(update={"top_p": 0.8, "top_k": 20})
@@ -139,3 +174,198 @@ def test_converse_request_adds_stop_schema_and_strict_tool_fields() -> None:
             },
         }
     }
+
+
+def _inline_media_request(
+    *parts: ImageContentPart | VideoContentPart, system: str | None = None
+) -> ModelRequest:
+    """Build one user message carrying the given inline media parts and a caption."""
+    messages: list[ModelMessage] = []
+    if system is not None:
+        messages.append(ModelMessage(role="system", content=system))
+    messages.append(
+        ModelMessage(
+            role="user",
+            content="describe",
+            content_parts=(*parts, TextContentPart(text="describe")),
+        )
+    )
+    return ModelRequest(messages=tuple(messages), maximum_output_tokens=32)
+
+
+def test_converse_request_rejects_inline_media_over_the_payload_ceiling() -> None:
+    """Inline media that individually fits but jointly exceeds 25 MB is refused pre-dispatch."""
+    chunk = base64.b64encode(b"\0" * (6 * 1024 * 1024)).decode()
+    videos = tuple(VideoContentPart(media_type="video/mp4", data=chunk) for _ in range(3))
+    with pytest.raises(ProviderParameterError, match="at most 25 MB including inline") as info:
+        converse_request("amazon.nova-lite-v1:0", _inline_media_request(*videos))
+    assert info.value.param == "messages"
+    assert info.value.code == "invalid_parameter"
+
+
+def test_converse_request_sums_inline_images_and_videos_together() -> None:
+    """The payload ceiling counts images and videos as one inline budget."""
+    video = VideoContentPart(
+        media_type="video/mp4",
+        data=base64.b64encode(b"\0" * (15 * 1024 * 1024)).decode(),
+    )
+    small = ImageContentPart(media_type="image/png", data=base64.b64encode(b"\0" * 1024).decode())
+    large = ImageContentPart(
+        media_type="image/png",
+        data=base64.b64encode(b"\0" * (3600 * 1024)).decode(),
+    )
+    payload = converse_request("amazon.nova-lite-v1:0", _inline_media_request(video, small))
+    blocks = cast("list[JsonObject]", cast("list[JsonObject]", payload["messages"])[0]["content"])
+    assert [next(iter(block)) for block in blocks] == ["video", "image", "text"]
+    with pytest.raises(ProviderParameterError):
+        converse_request("amazon.nova-lite-v1:0", _inline_media_request(video, large))
+
+
+def test_converse_request_measures_the_complete_body_not_only_inline_media() -> None:
+    """Text riding beside inline media counts toward the same 25 MB payload ceiling."""
+    video = VideoContentPart(
+        media_type="video/mp4",
+        data=base64.b64encode(b"\0" * (15 * 1024 * 1024)).decode(),
+    )
+    prose = "x" * (2 * 1024 * 1024)
+    converse_request("amazon.nova-lite-v1:0", _inline_media_request(video, system=prose))
+    with pytest.raises(ProviderParameterError) as info:
+        converse_request("amazon.nova-lite-v1:0", _inline_media_request(video, system=prose * 3))
+    assert info.value.param == "messages"
+
+
+def test_converse_request_does_not_cap_text_only_bodies() -> None:
+    """Without inline media the payload ceiling does not apply."""
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="y" * 26_000_000),),
+        maximum_output_tokens=32,
+    )
+    assert "messages" in converse_request("amazon.nova-lite-v1:0", request)
+
+
+def test_converse_request_emits_named_document_blocks_in_caller_order() -> None:
+    """PDF parts become ``document`` blocks with per-turn ordinal names when unnamed."""
+    pdf = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+    request = ModelRequest(
+        messages=(
+            ModelMessage(
+                role="user",
+                content="compare these",
+                content_parts=(
+                    DocumentContentPart(data=pdf, name="Report (Q3).pdf"),
+                    TextContentPart(text="compare these"),
+                    DocumentContentPart(data="JVBERi0xLjcK"),
+                ),
+            ),
+        ),
+    )
+    payload = converse_request("anthropic.claude-fixture", request)
+    messages = cast(list[JsonObject], payload["messages"])
+    assert messages[0]["content"] == [
+        {
+            "document": {
+                "name": "Report (Q3)-pdf",
+                "format": "pdf",
+                "source": {"bytes": pdf},
+            }
+        },
+        {"text": "compare these"},
+        {
+            "document": {
+                "name": "document-2",
+                "format": "pdf",
+                "source": {"bytes": "JVBERi0xLjcK"},
+            }
+        },
+    ]
+
+
+def test_converse_folds_a_mid_conversation_system_turn_into_the_adjacent_user_turn() -> None:
+    """Converse's top-level system hoists only the leading run; later ones ride as user blocks.
+
+    After a tool result the folded instruction is merged into the same user
+    message by ``push`` (Converse requires alternating roles), so the
+    transcript stays well-formed with the text at its original position.
+    """
+    request = _tool_transcript_request()
+    payload = converse_request(
+        "us.anthropic.claude-sonnet-4-5",
+        request.model_copy(
+            update={
+                "messages": (
+                    *request.messages[:2],
+                    ModelMessage(role="system", content="Reply in lowercase."),
+                    *request.messages[2:],
+                    ModelMessage(role="system", content="<total_tokens>1</total_tokens>"),
+                )
+            }
+        ),
+    )
+    assert payload["system"] == [{"text": "You are precise."}]
+    messages = cast(list[JsonObject], payload["messages"])
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    assert messages[0]["content"] == [{"text": "Create a ticket.\n\nReply in lowercase."}]
+    last = cast(list[JsonObject], messages[2]["content"])
+    assert "toolResult" in last[0]
+    assert last[1] == {"text": "<total_tokens>1</total_tokens>"}
+
+
+def test_gateway_converse_retains_tool_breakpoints_and_automatic_cache() -> None:
+    """Tools, tool calls, results and moving breakpoints use native checkpoints."""
+    from exp.runtime.anthropic_protocol.requests import decode_messages
+    from exp.runtime.models.providers.messages_payloads import bedrock_converse_stream_payload
+
+    request = decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 32,
+            "cache_control": {"type": "ephemeral"},
+            "tools": [
+                {
+                    "name": "lookup",
+                    "input_schema": {"type": "object"},
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_1",
+                            "name": "lookup",
+                            "input": {},
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": "found",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
+        }
+    ).request
+    payload = bedrock_converse_stream_payload("anthropic.claude-sonnet-4-6", request)
+    checkpoint = {"cachePoint": {"type": "default"}}
+    tools = payload["toolConfig"]
+    assert isinstance(tools, dict)
+    declared = tools["tools"]
+    assert isinstance(declared, list) and declared[-1] == checkpoint
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    for index in (1, 2):
+        message = messages[index]
+        assert isinstance(message, dict)
+        content = message["content"]
+        assert isinstance(content, list) and content[-1] == checkpoint
+        assert content.count(checkpoint) == 1

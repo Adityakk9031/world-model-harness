@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from exp.runtime.gateway.contracts import (
+from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
     CompatibilityField,
     CompatibilityManifest,
-    GatewayApiSurface,
 )
+from exp.runtime.gateway.contracts import GatewayApiSurface
 
 
 def _field(
@@ -36,6 +36,11 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "stream_options",
             )
         ),
+        # Forwarded only on BYOK OpenAI-family rungs (the caller pays the
+        # provider directly, so tier pricing is theirs); host-funded routes
+        # drop it with disclosure because the tier changes provider pricing
+        # while the gateway bills catalog rates.
+        _field("service_tier", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "service_tier"),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("stop", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "stop_sequences"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
@@ -50,37 +55,98 @@ CHAT_MANIFEST = CompatibilityManifest(
             "structured_output",
         ),
         _field("reasoning_effort", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        # Alternate enable-thinking shapes admitted and TRANSLATED to the canonical
+        # reasoning_effort at decode (the Responses-style nested `reasoning`, the
+        # Anthropic-style `thinking`, the vLLM-native `chat_template_kwargs`), so a
+        # caller's one payload turns thinking on in any shape.
+        _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        _field("thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        _field(
+            "chat_template_kwargs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"
+        ),
+        # DashScope's top-level spelling of the same switch (Qwen-family clients
+        # send it via extra_body); translated exactly like chat_template_kwargs.
+        _field("enable_thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
+        # Sampling penalties: admitted and adapted per rung — honored where the
+        # provider supports them, dropped with disclosure where it does not (a
+        # soft preference whose absence still returns a valid answer).
+        _field("frequency_penalty", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "penalties"),
+        _field("presence_penalty", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "penalties"),
+        # Accepted only at its no-op default of 1 (the wire model enforces
+        # the value): Copilot hardcodes n:1 on every Chat request.
+        _field("n", CompatibilityDisposition.SUPPORTED),
+        # Retention request accepted only at its no-op default of false (the
+        # wire model enforces the value): OpenAI-style agents (omp, opencode,
+        # pi) hardcode store:false on every Chat request to opt out of
+        # provider-side retention. This gateway never retains Chat output on
+        # any rung, so false is already satisfied and store:true is rejected:
+        # silently dropping a retention request would be dishonest.
+        _field("store", CompatibilityDisposition.SUPPORTED),
+        # top_logprobs stays UNSUPPORTED: the gateway response contract does not
+        # project logprob arrays yet, so it cannot be honored on any rung —
+        # rejecting is the honest outcome (never a silent drop of a probability
+        # request). Admit it only once response normalization emits logprobs.
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
-        # End-user attribution / cache hints (OpenAI spec). Accepted and recorded
-        # gateway-side, never forwarded to the model: `safety_identifier` is the
-        # current stable end-user identifier, `user` its deprecated predecessor,
-        # `prompt_cache_key` a same-prefix cache-routing hint (not identity).
+        # End-user attribution (OpenAI spec). Accepted and recorded gateway-side,
+        # never forwarded to the model: `safety_identifier` is the current
+        # stable end-user identifier, `user` its deprecated predecessor.
+        # `prompt_cache_key` is a same-prefix cache-routing hint (not identity):
+        # the caller's value never leaves the gateway, but a tenant-namespaced
+        # digest of it (or of the conversation stem) dispatches to rungs whose
+        # provider routes by the field (prompt_cache_affinity.py).
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
-        _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
+        _field("prompt_cache_key", CompatibilityDisposition.CONDITIONALLY_SUPPORTED),
+        # OpenRouter-shaped routing preferences. `zdr: true` demands
+        # zero-data-retention routing for this request (honored at admission
+        # on every route); the object forwards to OpenRouter rungs and is
+        # dropped on wires that have no such field.
+        _field("provider", CompatibilityDisposition.SUPPORTED),
+        # Both API surfaces share the native Responses output-length hint;
+        # other routes omit it with disclosure. Values remain validated.
+        _field("verbosity", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "verbosity"),
+        # Pre-answer web search. OpenAI's ``web_search_options`` and the
+        # OpenRouter ``plugins: [{"id": "web"}]`` extension (and the ``:online``
+        # model suffix) normalize to one gateway search: a route with no
+        # provider-native search gets the gateway's own (results injected, sources
+        # cited, one search counted); without a configured backend the request
+        # still serves and the drop is disclosed.
+        _field(
+            "web_search_options", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "web_search"
+        ),
+        _field("plugins", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "web_search"),
+        # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
+        # is admitted per route; ``audio`` and ``modalities`` request audio
+        # OUTPUT, which no route serves.
+        # Explicit prompt-cache boundaries: Chat callers can name cache
+        # breakpoints and retention. No rung honors those selectors yet, so
+        # both stay refused rather than silently dropped. The
+        # ``prompt_cache_boundaries`` capability records that decision for
+        # catalog metadata; implicit prefix caching is a different fact.
+        _field(
+            "prompt_cache_options",
+            CompatibilityDisposition.UNSUPPORTED,
+            "prompt_cache_boundaries",
+        ),
+        _field(
+            "prompt_cache_retention",
+            CompatibilityDisposition.UNSUPPORTED,
+            "prompt_cache_boundaries",
+        ),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
                 "audio",
-                "frequency_penalty",
                 "function_call",
                 "functions",
                 "logit_bias",
                 "modalities",
                 "moderation",
-                "n",
                 "prediction",
-                "presence_penalty",
-                "prompt_cache_options",
-                "prompt_cache_retention",
                 "seed",
-                "service_tier",
-                "store",
-                "verbosity",
-                "web_search_options",
             )
         ),
     ),
@@ -104,6 +170,8 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "store",
             )
         ),
+        # Same BYOK-only forwarding rule as the Chat surface.
+        _field("service_tier", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "service_tier"),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("include", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "encrypted_reasoning"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
@@ -121,26 +189,37 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
+        # Accepted only at their no-op values (the wire models enforce them):
+        # Copilot hardcodes truncation:"disabled" and
+        # prompt_cache_options:{"mode":"implicit"} on every Responses request,
+        # and both describe exactly the behavior this gateway already serves
+        # (context is never truncated; served routes cache implicitly).
+        _field("truncation", CompatibilityDisposition.SUPPORTED),
+        _field("prompt_cache_options", CompatibilityDisposition.SUPPORTED),
+        # The Responses tool-call cap is refused until a route can honor it.
+        # ``tool_call_limit`` is the catalog vocabulary for that decision.
+        _field("max_tool_calls", CompatibilityDisposition.UNSUPPORTED, "tool_call_limit"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec), same handling as the
         # Chat surface: accepted and recorded gateway-side, never forwarded.
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
-        _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
+        _field("prompt_cache_key", CompatibilityDisposition.CONDITIONALLY_SUPPORTED),
+        # OpenRouter-shaped routing preferences. `zdr: true` demands
+        # zero-data-retention routing for this request (honored at admission
+        # on every route); the object forwards to OpenRouter rungs and is
+        # dropped on wires that have no such field.
+        _field("provider", CompatibilityDisposition.SUPPORTED),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
                 "background",
                 "context_management",
                 "conversation",
-                "max_tool_calls",
                 "moderation",
                 "prompt",
-                "prompt_cache_options",
                 "prompt_cache_retention",
-                "service_tier",
                 "stream_options",
-                "truncation",
             )
         ),
     ),
@@ -185,15 +264,20 @@ RESPONSES_INCLUDE_PATHS_REJECTED = frozenset(
         "web_search_call.results",
     }
 )
-"""``include`` selectors consciously rejected: each names a server-tool or
-multimodal surface this gateway does not serve, so honoring the selector is
-impossible and accepting it would be silent."""
+"""``include`` selectors consciously rejected: each asks the response to echo
+a server-tool or stored-content surface this gateway does not retain (image
+input is served, but the gateway does not echo the caller's image back), so
+honoring the selector is impossible and accepting it would be silent."""
 
 
 RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED: dict[str, frozenset[str]] = {
     "message": frozenset({"type", "role", "content", "id", "status", "phase"}),
-    "function_call": frozenset({"type", "call_id", "name", "arguments", "id", "status"}),
-    "function_call_output": frozenset({"type", "call_id", "output", "id", "status"}),
+    "function_call": frozenset(
+        {"type", "call_id", "name", "namespace", "caller", "arguments", "id", "status"}
+    ),
+    "function_call_output": frozenset(
+        {"type", "call_id", "output", "name", "namespace", "caller", "id", "status"}
+    ),
     "reasoning": frozenset({"type", "id", "encrypted_content", "summary", "content", "status"}),
 }
 """Echoable input-item fields the Responses decoder models per item type.
@@ -203,26 +287,29 @@ INPUT, so every field this gateway's own output items carry must decode.
 Codex echoes assistant messages with ``phase`` and reasoning items with an
 explicit ``content: null`` (both captured live 2026-08-29); the message
 ``phase`` is retained for replay identity and the null reasoning content
-is validated and dropped like its populated form.
+is validated and dropped like its populated form. ``namespace`` on a
+``function_call`` (and the ``name``/``namespace`` pair on a
+``function_call_output``) attributes the call to its declaring nested tool
+tree and round-trips verbatim: the provider rejects a namespaced call
+replayed without it ("Missing namespace for function_call ..."), which
+wedges every later turn of the session. ``caller`` is SDK 3.0's opaque
+programmatic tool-calling attribution (``{"type": "program", "id": ...}``);
+its internal shape is an evolving provider surface, so it is validated only
+as an object and round-trips verbatim like ``namespace``.
 """
 
 RESPONSES_INPUT_ITEM_FIELDS_REJECTED: dict[str, frozenset[str]] = {
     "message": frozenset(),
-    "function_call": frozenset({"caller", "namespace"}),
-    "function_call_output": frozenset({"caller", "namespace", "name"}),
+    "function_call": frozenset(),
+    "function_call_output": frozenset(),
     "reasoning": frozenset(),
 }
-"""Echoable input-item fields consciously rejected with a named 400.
-
-``caller``/``namespace`` attribute server-tool invocations this gateway does
-not serve, and a ``name`` on a function output duplicates the call linkage
-already carried by ``call_id``.
-"""
+"""Echoable input-item fields consciously rejected with a named 400."""
 
 
 CHAT_CACHE_CONTROL_PLACEMENTS: dict[str, str] = {
-    "messages": "validated_and_dropped",
-    "messages.content": "validated_and_dropped",
+    "messages": "validated_and_forwarded_to_cache_capable_adapters",
+    "messages.content": "validated_and_forwarded_to_cache_capable_adapters",
     "messages.tool_calls": "validated_and_forwarded_to_anthropic_tool_use",
 }
 """Every Chat-surface ``cache_control`` placement and its conscious decision.
@@ -232,10 +319,61 @@ last content part of recent messages for Claude-family model ids; depending
 on that part's shape the hint lands on the message, a text part, or inside a
 ``tool_calls`` entry. Placements are classified here so a new placement is a
 recorded decision (this table plus its behavior test), never a silent 400.
-Only the tool-call placement forwards: Anthropic defines tool_use-block
-caching natively, and non-Anthropic routes disclose the omission through
-``ignored_parameters``.
+Validated placements ride canonical cache carriers. Anthropic, Bedrock and
+OpenRouter adapters forward or translate them; other routes disclose omission.
 """
+
+
+EMBEDDINGS_MANIFEST = CompatibilityManifest(
+    schema_version=1,
+    surface=GatewayApiSurface.EMBEDDINGS,
+    fields=(
+        *(
+            _field(path, CompatibilityDisposition.SUPPORTED)
+            for path in (
+                "model",
+                "input",
+                "dimensions",
+                "encoding_format",
+            )
+        ),
+        # End-user attribution (OpenAI spec): accepted and recorded gateway-side,
+        # never forwarded to the provider. The embeddings body carries no
+        # safety_identifier / prompt_cache_key, so `user` is the only one.
+        _field("user", CompatibilityDisposition.METADATA_ONLY),
+    ),
+)
+
+
+IMAGES_MANIFEST = CompatibilityManifest(
+    schema_version=1,
+    surface=GatewayApiSurface.IMAGES,
+    fields=(
+        *(
+            _field(path, CompatibilityDisposition.SUPPORTED)
+            for path in (
+                "model",
+                "prompt",
+                "n",
+                "size",
+                "quality",
+                "background",
+                "output_format",
+                "output_compression",
+                "moderation",
+                "response_format",
+                "style",
+            )
+        ),
+        # End-user attribution: recorded gateway-side, never forwarded.
+        _field("user", CompatibilityDisposition.METADATA_ONLY),
+        # Streaming partial images is a Responses-style event stream the
+        # buffered images surface does not carry; a request asking for it is
+        # refused explicitly rather than silently answered whole.
+        _field("stream", CompatibilityDisposition.UNSUPPORTED),
+        _field("partial_images", CompatibilityDisposition.UNSUPPORTED),
+    ),
+)
 
 
 def disposition_map(manifest: CompatibilityManifest) -> dict[str, CompatibilityDisposition]:

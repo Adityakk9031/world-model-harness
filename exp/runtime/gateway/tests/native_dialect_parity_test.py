@@ -89,9 +89,11 @@ GEMINI_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
         "raw_arguments": _GEMINI_RAW_ARGUMENTS,
     },
     {
+        # Gemini thoughts are additive on the wire, so the engine folds the 3
+        # thought tokens into the output total and reports them as its subset.
         "kind": "usage",
         "input_tokens": 11,
-        "output_tokens": 5,
+        "output_tokens": 8,
         "cached_input_tokens": 2,
         "reasoning_tokens": 3,
     },
@@ -99,6 +101,41 @@ GEMINI_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
 )
 
 GEMINI_REFUSAL_CHUNKS: tuple[bytes, ...] = (_sse({"candidates": [{"finishReason": "SAFETY"}]}),)
+
+# A prompt-level block as Google delivers it (production capture shape,
+# 2026-09-04): one frame, no candidates, the block named on promptFeedback,
+# and usageMetadata counting the processed prompt.
+GEMINI_PROMPT_BLOCK_CHUNKS: tuple[bytes, ...] = (
+    _sse(
+        {
+            "promptFeedback": {
+                "blockReason": "PROHIBITED_CONTENT",
+                "safetyRatings": [
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}
+                ],
+            },
+            "usageMetadata": {"promptTokenCount": 42, "totalTokenCount": 42},
+        }
+    ),
+)
+
+GEMINI_PROMPT_BLOCK_EVENTS: tuple[JsonObject, ...] = (
+    {
+        "kind": "usage",
+        "input_tokens": 42,
+        # Gemini's present usageMetadata follows proto3 scalar-zero omission.
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": None,
+    },
+    {
+        "kind": "failed",
+        "failure_class": "refusal",
+        # PROHIBITED_CONTENT names the content-policy category.
+        "safe_message": "provider refused the request: content policy",
+        "refusal_reason": "content_policy",
+    },
+)
 
 GEMINI_INCOMPLETE_CHUNKS: tuple[bytes, ...] = (
     _sse({"candidates": [{"content": {"parts": [{"text": "cut"}]}}]}),
@@ -196,11 +233,14 @@ def _simplified(event: GatewayEvent) -> JsonObject:
     if event.kind is GatewayEventKind.INCOMPLETE:
         return {"kind": "incomplete"}
     assert event.failure is not None
-    return {
+    failed: JsonObject = {
         "kind": "failed",
         "failure_class": event.failure.failure_class.value,
         "safe_message": event.failure.safe_message,
     }
+    if event.failure.refusal_reason is not None:
+        failed["refusal_reason"] = event.failure.refusal_reason.value
+    return failed
 
 
 def test_native_gemini_normalizer_matches_the_golden_fixture() -> None:
@@ -219,18 +259,135 @@ def test_native_gemini_normalizer_matches_the_golden_fixture() -> None:
         {
             "kind": "failed",
             "failure_class": "refusal",
-            "safe_message": "provider refused the request",
+            "safe_message": "provider refused the request: content policy",
+            "refusal_reason": "content_policy",
         }
     ]
 
 
-def test_native_gemini_normalizer_fails_streams_without_a_terminal() -> None:
-    """A stream that closes before its terminal candidate fails as malformed."""
+def test_native_gemini_normalizer_classifies_googles_error_envelope() -> None:
+    """Google's error envelope on the stream is the provider declaring failure,
+    classified by what it says: an overloaded model is a throttle (fail over,
+    Retry-After), never a malformed stream end and never a synthesized
+    completion after prior output. A genuine fault stays provider_internal."""
+    envelope = _sse(
+        {
+            "error": {
+                "code": 503,
+                "message": "The model is overloaded. Please try again later.",
+                "status": "UNAVAILABLE",
+            }
+        }
+    )
+    failed = {
+        "kind": "failed",
+        "failure_class": "throttled",
+        "safe_message": (
+            "provider throttled the request; retry after the delay in the Retry-After header"
+        ),
+    }
+    alone = _native_normalized("gemini_generate_content", (envelope,))
+    assert alone["failure"] is None
+    assert alone["events"] == [failed]
+    after_output = _native_normalized(
+        "gemini_generate_content", (GEMINI_GOLDEN_CHUNKS[0], envelope)
+    )
+    assert after_output["failure"] is None
+    assert after_output["events"] == [{"kind": "text_delta", "text": "Hel"}, failed]
+    internal = _native_normalized(
+        "gemini_generate_content",
+        (
+            _sse(
+                {
+                    "error": {
+                        "code": 500,
+                        "message": "Internal error encountered.",
+                        "status": "INTERNAL",
+                    }
+                }
+            ),
+        ),
+    )
+    assert internal["events"] == [
+        {
+            "kind": "failed",
+            "failure_class": "provider_internal",
+            "safe_message": "provider stream failed",
+        }
+    ]
+
+
+def test_native_gemini_normalizer_refuses_a_blocked_prompt() -> None:
+    """A prompt Google blocks arrives with no candidates at all. It is the
+    provider's refusal (the same terminal a SAFETY finish produces, after the
+    usage it reported), never a stream that "ended without a terminal event"
+    to be retried and failed over."""
+    result = _native_normalized("gemini_generate_content", GEMINI_PROMPT_BLOCK_CHUNKS)
+    assert result["failure"] is None
+    assert result["events"] == list(GEMINI_PROMPT_BLOCK_EVENTS)
+
+
+def test_native_gemini_normalizer_completes_a_clean_end_after_content() -> None:
+    """A stream that closes after content, with no finishReason frame, is a
+    normal completion: Gemini legitimately ends some streams that way, and the
+    real answer must not be thrown away as malformed."""
     result = _native_normalized("gemini_generate_content", GEMINI_GOLDEN_CHUNKS[:1])
-    assert result["events"] == [{"kind": "text_delta", "text": "Hel"}]
+    assert result["failure"] is None
+    assert result["events"] == [
+        {"kind": "text_delta", "text": "Hel"},
+        {"kind": "completed"},
+    ]
+
+
+def test_native_gemini_normalizer_fails_streams_that_produced_no_content() -> None:
+    """A stream that closes having emitted NO content at all stays malformed:
+    a usage-only trailer with no candidates has no answer to complete."""
+    trailer = _sse({"usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 0}})
+    result = _native_normalized("gemini_generate_content", (trailer,))
+    assert result["events"] == []
     failure = result["failure"]
     assert isinstance(failure, dict)
     assert failure["failure_class"] == "malformed_response"
+
+
+def test_native_gemini_normalizer_recovers_a_partial_before_an_abnormal_frame() -> None:
+    """Content, then a structurally malformed frame: the partial answer is kept
+    and the turn ends `incomplete` (an early-termination finish reason) with the
+    last-seen usage folded, never discarded as malformed. Gemini uniquely ends
+    legitimate turns abnormally, so a break after content is a truncated answer,
+    not corruption."""
+    chunks = (
+        _sse({"candidates": [{"content": {"parts": [{"text": "partial"}]}}]}),
+        _sse({"usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 3}}),
+        # A non-string text part after content: malformed mid-stream frame.
+        _sse({"candidates": [{"content": {"parts": [{"text": 5}]}}]}),
+    )
+    result = _native_normalized("gemini_generate_content", chunks)
+    assert result["failure"] is None
+    assert result["events"] == [
+        {"kind": "text_delta", "text": "partial"},
+        {
+            "kind": "usage",
+            "input_tokens": 9,
+            "output_tokens": 3,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": None,
+        },
+        {"kind": "incomplete"},
+    ]
+
+
+def test_native_gemini_normalizer_reclassifies_a_pre_content_abnormal_frame() -> None:
+    """A malformed frame before any content is a Gemini abnormal end with
+    nothing to salvage: it is reclassified from a hard malformed reject to a
+    retryable transport failure (retry the lane, then fail over), and no content
+    is emitted."""
+    chunk = _sse({"candidates": [{"content": {"parts": [{"text": 5}]}}]})
+    result = _native_normalized("gemini_generate_content", (chunk,))
+    assert result["events"] == []
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "transport"
 
 
 def _eventstream_message(name: str, payload: JsonObject, *, exception: bool = False) -> bytes:
@@ -310,6 +467,7 @@ BEDROCK_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
         "input_tokens": 12,
         "output_tokens": 4,
         "cached_input_tokens": 2,
+        "cache_creation_input_tokens": 1,
         "reasoning_tokens": None,
     },
     {"kind": "completed"},
@@ -344,7 +502,9 @@ def test_native_bedrock_normalizer_matches_the_golden_fixture() -> None:
         {
             "kind": "failed",
             "failure_class": "refusal",
-            "safe_message": "provider refused the request",
+            # guardrail_intervened is a content-policy verdict.
+            "safe_message": "provider refused the request: content policy",
+            "refusal_reason": "content_policy",
         },
     ]
 
@@ -443,6 +603,10 @@ ANTHROPIC_THINKING_EVENTS: tuple[JsonObject, ...] = (
     {"kind": "thinking_delta", "index": 0, "text": "step one"},
     {"kind": "thinking_signature", "index": 0, "signature": "c2ln"},
     {"kind": "redacted_thinking", "index": 1, "data": "b3BhcXVl"},
+    # Every Anthropic text block opens with its boundary event so the
+    # Messages encoder mirrors the provider's block structure (citations
+    # attach per block); block-less encoders ignore it.
+    {"kind": "text_block_started", "index": 2},
     {"kind": "text_delta", "text": "Hi"},
     {
         "kind": "usage",
@@ -457,11 +621,30 @@ ANTHROPIC_THINKING_EVENTS: tuple[JsonObject, ...] = (
 )
 
 
+def _anthropic_start_usage(
+    input_tokens: int, output_tokens: int | None, cached: int
+) -> dict[str, object]:
+    """The usage event an Anthropic ``message_start`` now surfaces before content.
+
+    The start-frame meters reach the Messages encoder's own ``message_start``
+    (Claude Code reads input there) and stand in for settlement until the
+    terminal report supersedes them at ``message_stop``.
+    """
+    return {
+        "kind": "usage",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_input_tokens": cached,
+        "reasoning_tokens": None,
+    }
+
+
 def test_native_anthropic_normalizer_emits_thinking_events() -> None:
     """Extended-thinking frames normalize to dedicated events, never silence."""
     result = _native_normalized("anthropic_messages", ANTHROPIC_THINKING_CHUNKS)
     assert result["failure"] is None
-    assert result["events"] == list(ANTHROPIC_THINKING_EVENTS)
+    # message_start omits output_tokens; only message_delta reports its total.
+    assert result["events"] == [_anthropic_start_usage(8, None, 2), *ANTHROPIC_THINKING_EVENTS]
 
 
 # Captured from a live api.anthropic.com tool_use stream (2026-08-28,
@@ -520,7 +703,7 @@ def test_native_anthropic_normalizer_decodes_the_live_tool_use_wire() -> None:
     """The real captured tool_use wire decodes to the canonical event stream."""
     result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_TOOL_FRAMES)
     assert result["failure"] is None
-    assert result["events"] == list(ANTHROPIC_LIVE_TOOL_EVENTS)
+    assert result["events"] == [_anthropic_start_usage(663, 12, 0), *ANTHROPIC_LIVE_TOOL_EVENTS]
 
 
 # Captured live (2026-08-28, claude-haiku-4-5, ids neutralized): a
@@ -556,6 +739,7 @@ def test_native_anthropic_normalizer_completes_a_zero_argument_tool_call() -> No
     result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_ZERO_ARG_FRAMES)
     assert result["failure"] is None
     assert result["events"] == [
+        _anthropic_start_usage(550, 21, 0),
         {"kind": "tool_call_started", "index": 0, "call_id": "toolu_fixture", "name": "get_time"},
         {"kind": "tool_arguments_delta", "index": 0, "text": ""},
         # The completion-time seed streams before the completed call so every
@@ -576,6 +760,126 @@ def test_native_anthropic_normalizer_completes_a_zero_argument_tool_call() -> No
             "reasoning_tokens": None,
         },
         {"kind": "completed"},
+    ]
+
+
+# Captured from a live api.anthropic.com web_search stream (2026-08-31,
+# claude-haiku-4-5, ids neutralized, results trimmed to one and encrypted
+# payloads shortened; structure and frame order are the real wire): the
+# server_tool_use block streams input like a client tool but with an
+# srvtoolu_ id, the whole web_search_tool_result block (caller field
+# included) rides its start frame, the answer text block opens with an empty
+# citations array and its citations_delta arrives BEFORE the first
+# text_delta, and the terminal usage reports the true post-search input
+# total (12284) that the message_start count (2230) severely undercounts.
+ANTHROPIC_LIVE_WEB_SEARCH_FRAMES: tuple[bytes, ...] = (
+    b'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-haiku-4-5",'
+    b'"id":"msg_fixture","type":"message","role":"assistant","content":[],"stop_reason":null,'
+    b'"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2230,'
+    b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":'
+    b'{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":25,'
+    b'"service_tier":"standard","inference_geo":"not_available"}}         }\n\n',
+    b'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+    b'"content_block":{"type":"server_tool_use","id":"srvtoolu_fixture","name":"web_search",'
+    b'"input":{}}            }\n\n',
+    b'event: ping\ndata: {"type": "ping"}\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    b'"delta":{"type":"input_json_delta","partial_json":""}             }\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    b'"delta":{"type":"input_json_delta","partial_json":"{\\"query\\": \\"c"}}\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    b'"delta":{"type":"input_json_delta","partial_json":"urrent stable Python\\"}"}  }\n\n',
+    b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0 }\n\n',
+    b'event: content_block_start\ndata: {"type":"content_block_start","index":1,'
+    b'"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_fixture",'
+    b'"content":[{"type":"web_search_result","title":"Python versions",'
+    b'"url":"https://www.python.org/doc/versions/","encrypted_content":"Et8QCioIExgC",'
+    b'"page_age":"March 12, 2026"}],"caller":{"type":"direct"}}        }\n\n',
+    b'event: content_block_stop\ndata: {"type":"content_block_stop","index":1    }\n\n',
+    b'event: content_block_start\ndata: {"type":"content_block_start","index":2,'
+    b'"content_block":{"citations":[],"type":"text","text":""}}\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,'
+    b'"delta":{"type":"citations_delta","citation":{"type":"web_search_result_location",'
+    b'"cited_text":"Python 3.14.7, released on 5 August 2026",'
+    b'"url":"https://www.python.org/doc/versions/","title":"Python versions",'
+    b'"encrypted_index":"Eo8BCioIExgC"}}  }\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,'
+    b'"delta":{"type":"text_delta","text":"The"}       }\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,'
+    b'"delta":{"type":"text_delta","text":" current stable Python version is 3.14.7."} }\n\n',
+    b'event: content_block_stop\ndata: {"type":"content_block_stop","index":2 }\n\n',
+    b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn",'
+    b'"stop_sequence":null,"stop_details":null},"usage":{"input_tokens":12284,'
+    b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":103,'
+    b'"server_tool_use":{"web_search_requests":1,"web_fetch_requests":0}}     }\n\n',
+    b'event: message_stop\ndata: {"type":"message_stop"  }\n\n',
+)
+
+ANTHROPIC_LIVE_WEB_SEARCH_EVENTS: tuple[JsonObject, ...] = (
+    {
+        "kind": "server_tool_use_started",
+        "index": 0,
+        "call_id": "srvtoolu_fixture",
+        "name": "web_search",
+    },
+    {"kind": "server_tool_arguments_delta", "index": 0, "text": ""},
+    {"kind": "server_tool_arguments_delta", "index": 0, "text": '{"query": "c'},
+    {"kind": "server_tool_arguments_delta", "index": 0, "text": 'urrent stable Python"}'},
+    {
+        "kind": "server_tool_use_completed",
+        "index": 0,
+        "call_id": "srvtoolu_fixture",
+        "name": "web_search",
+        "raw_arguments": '{"query": "current stable Python"}',
+    },
+    {
+        "kind": "server_tool_result",
+        "index": 1,
+        "block": (
+            '{"type":"web_search_tool_result","tool_use_id":"srvtoolu_fixture",'
+            '"content":[{"type":"web_search_result","title":"Python versions",'
+            '"url":"https://www.python.org/doc/versions/","encrypted_content":"Et8QCioIExgC",'
+            '"page_age":"March 12, 2026"}],"caller":{"type":"direct"}}'
+        ),
+    },
+    {"kind": "text_block_started", "index": 2},
+    {
+        "kind": "citation_delta",
+        "index": 2,
+        "citation": (
+            '{"type":"web_search_result_location",'
+            '"cited_text":"Python 3.14.7, released on 5 August 2026",'
+            '"url":"https://www.python.org/doc/versions/","title":"Python versions",'
+            '"encrypted_index":"Eo8BCioIExgC"}'
+        ),
+    },
+    {"kind": "text_delta", "text": "The"},
+    {"kind": "text_delta", "text": " current stable Python version is 3.14.7."},
+    {
+        "kind": "usage",
+        # The terminal usage report supersedes the start-frame input legs:
+        # the model re-reads fetched results as input.
+        "input_tokens": 12284,
+        "output_tokens": 103,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": None,
+    },
+    {"kind": "completed"},
+)
+
+
+def test_native_anthropic_normalizer_decodes_the_live_web_search_wire() -> None:
+    """The captured WebSearch wire decodes to dedicated server-tool events.
+
+    Production incident (2026-08-31 class): server_tool_use blocks were
+    skipped as unknown, so their input_json_delta frames failed the whole
+    stream as malformed, and the request itself 400d at decode.
+    """
+    result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_WEB_SEARCH_FRAMES)
+    assert result["failure"] is None
+    assert result["events"] == [
+        _anthropic_start_usage(2230, 25, 0),
+        *ANTHROPIC_LIVE_WEB_SEARCH_EVENTS,
     ]
 
 
@@ -750,7 +1054,7 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
         native.completed_responses_fixture(
             "request-official",
             "gpt-5.6-sol",
-            1_700_000_000.0,
+            1_700_000_000,
             "{}",
             events_json,
         )
@@ -775,7 +1079,7 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
     frames = native.encode_responses_fixture(
         "request-official",
         "gpt-5.6-sol",
-        1_700_000_000.0,
+        1_700_000_000,
         "{}",
         events_json,
     )
@@ -788,3 +1092,284 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
     assert not any(
         payload["type"].startswith("response.function_call_arguments") for payload in payloads
     )
+
+
+def test_native_responses_serves_hosted_tool_items_end_to_end() -> None:
+    """Hosted-tool output items (web_search_call, mcp_call) pass through the
+    normalizer, the aggregated body, and the public stream verbatim, with
+    URL-citation annotations attached to the answer's text part.
+
+    Production incident (2026-09-04): the `response.output_item.added` frame
+    for a web_search_call killed the whole stream as malformed_response
+    post-dispatch across three orgs.
+    """
+    from openai.types.responses.response import Response
+    from openai.types.responses.response_output_item_done_event import (
+        ResponseOutputItemDoneEvent,
+    )
+
+    web_search_done = {
+        "id": "ws_1",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "current stable Python"},
+    }
+    mcp_done = {
+        "id": "mcp_1",
+        "type": "mcp_call",
+        "server_label": "deepwiki",
+        "name": "ask_question",
+        "arguments": '{"q": "pi"}',
+        "output": "3.14159",
+        "status": "completed",
+    }
+    chunks = (
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "ws_1", "type": "web_search_call", "status": "in_progress"},
+            }
+        ),
+        _sse(
+            {
+                "type": "response.web_search_call.searching",
+                "item_id": "ws_1",
+                "output_index": 0,
+                "sequence_number": 4,
+            }
+        ),
+        _sse({"type": "response.output_item.done", "output_index": 0, "item": web_search_done}),
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "id": "mcp_1",
+                    "type": "mcp_call",
+                    "server_label": "deepwiki",
+                    "name": "ask_question",
+                    "arguments": "",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.mcp_call_arguments.delta",
+                "item_id": "mcp_1",
+                "output_index": 1,
+                "delta": '{"q": "pi"}',
+                "sequence_number": 8,
+            }
+        ),
+        _sse({"type": "response.output_item.done", "output_index": 1, "item": mcp_done}),
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 2,
+                "item": {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "status": "in_progress",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_text.delta",
+                "output_index": 2,
+                "item_id": "msg_1",
+                "content_index": 0,
+                "delta": "Python 3.14.7.",
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_text.annotation.added",
+                "output_index": 2,
+                "item_id": "msg_1",
+                "content_index": 0,
+                "annotation_index": 0,
+                "annotation": {
+                    "type": "url_citation",
+                    "url": "https://www.python.org/doc/versions/",
+                    "title": "Python versions",
+                    "start_index": 0,
+                    "end_index": 14,
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "usage": {"input_tokens": 320, "output_tokens": 41, "total_tokens": 361},
+                },
+            }
+        ),
+    )
+    normalized = _native_normalized("openai_responses", chunks)
+    assert normalized["failure"] is None
+    events = cast(list[JsonObject], normalized["events"])
+    kinds = [event["kind"] for event in events]
+    assert kinds == [
+        "hosted_tool_item_started",
+        "hosted_tool_item_progress",
+        "hosted_tool_item_completed",
+        "hosted_tool_item_started",
+        "hosted_tool_item_progress",
+        "hosted_tool_item_completed",
+        "provider_output_item_started",
+        "provider_text_delta",
+        "provider_text_annotation",
+        "provider_output_item_completed",
+        "usage",
+        "completed",
+    ]
+
+    native = pytest.importorskip("exp_gateway_native")
+    events_json = json.dumps(events)
+    body = json.loads(
+        native.completed_responses_fixture(
+            "request-hosted",
+            "gpt-5.6-sol",
+            1_700_000_000,
+            "{}",
+            events_json,
+        )
+    )
+    parsed = Response.model_validate(body)
+    assert [item.type for item in parsed.output] == ["web_search_call", "mcp_call", "message"]
+    assert body["output"][0] == web_search_done
+    assert body["output"][1] == mcp_done
+    message = body["output"][2]
+    assert message["content"][0]["text"] == "Python 3.14.7."
+    assert message["content"][0]["annotations"][0]["type"] == "url_citation"
+    assert parsed.usage is not None and parsed.usage.input_tokens == 320
+
+    frames = native.encode_responses_fixture(
+        "request-hosted",
+        "gpt-5.6-sol",
+        1_700_000_000,
+        "{}",
+        events_json,
+    )
+    payloads = [json.loads(frame.split("data: ", 1)[1]) for frame in frames if "data: " in frame]
+    searching = next(
+        payload for payload in payloads if payload["type"] == "response.web_search_call.searching"
+    )
+    # The public frame is re-stamped by the gateway: its own monotonic
+    # sequence, its own output index; the provider's payload fields survive.
+    assert searching["output_index"] == 0
+    assert searching["item_id"] == "ws_1"
+    sequence_numbers = [payload["sequence_number"] for payload in payloads]
+    assert sequence_numbers == sorted(set(sequence_numbers))
+    for payload in payloads:
+        if payload["type"] == "response.output_item.done":
+            ResponseOutputItemDoneEvent.model_validate(payload)
+    annotation_added = next(
+        payload
+        for payload in payloads
+        if payload["type"] == "response.output_text.annotation.added"
+    )
+    assert annotation_added["annotation"]["url"] == "https://www.python.org/doc/versions/"
+
+
+def test_native_responses_serves_a_budget_truncated_function_call_as_incomplete() -> None:
+    """A function call the provider itself cut at max_output_tokens serves as
+    an incomplete response with the truncated item intact, never a 502.
+
+    Frame shapes captured live from api.openai.com (gpt-6-astra, 2026-09-05):
+    `function_call_arguments.done` carries the PARTIAL bytes, the item's own
+    status is `incomplete`, and the terminal is `response.incomplete`.
+    Production incident (2026-09-05, ~5/min): the partial arguments failed the
+    strict JSON completion contract and killed the stream post-dispatch.
+    """
+    from openai.types.responses.response import Response
+
+    truncated_args = '{"city":"Paris","country":"France","units":"metric'
+    chunks = (
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_astra",
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "arguments": "",
+                    "call_id": "call_astra",
+                    "name": "get_weather",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_astra",
+                "output_index": 0,
+                "delta": truncated_args,
+            }
+        ),
+        _sse(
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_astra",
+                "output_index": 0,
+                "arguments": truncated_args,
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_astra",
+                    "type": "function_call",
+                    "status": "incomplete",
+                    "arguments": truncated_args,
+                    "call_id": "call_astra",
+                    "name": "get_weather",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {"input_tokens": 62, "output_tokens": 24, "total_tokens": 86},
+                },
+            }
+        ),
+    )
+    normalized = _native_normalized("openai_responses", chunks)
+    assert normalized["failure"] is None
+    events = cast(list[JsonObject], normalized["events"])
+    kinds = [event["kind"] for event in events]
+    assert "tool_call_completed" not in kinds, kinds
+    assert kinds[-1] == "incomplete"
+
+    native = pytest.importorskip("exp_gateway_native")
+    events_json = json.dumps(events)
+    body = json.loads(
+        native.completed_responses_fixture(
+            "request-astra",
+            "gpt-6-astra",
+            1_700_000_000,
+            "{}",
+            events_json,
+        )
+    )
+    parsed = Response.model_validate(body)
+    assert parsed.status == "incomplete"
+    item = body["output"][0]
+    # The caller sees the provider's honest truncation: the item at its own
+    # incomplete status with the partial argument bytes, like OpenAI's wire.
+    assert item["type"] == "function_call"
+    assert item["status"] == "incomplete"
+    assert item["arguments"] == truncated_args

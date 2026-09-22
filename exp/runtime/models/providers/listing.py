@@ -11,6 +11,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, cast
+from urllib.parse import urlencode
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ReasoningEffort
@@ -34,6 +35,8 @@ from exp.runtime.models.providers.transport import (
 
 LISTING_TIMEOUT_SECONDS = 20.0
 LISTING_RETRY_POLICY = RetryPolicy(maximum_attempts=2)
+_ANTHROPIC_PAGE_SIZE = 1_000
+_MAXIMUM_ANTHROPIC_PAGES = 10
 _MAXIMUM_GEMINI_PAGES = 10
 _CREDENTIAL_STATUS_CODES = frozenset({401, 403})
 
@@ -165,17 +168,39 @@ class HttpProviderModelLister:
         return body.get("data")
 
     def _anthropic_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
-        """List Anthropic models, which publish only model identities."""
+        """List Anthropic model identities across bounded cursor pages."""
         base_url = _base_url(endpoint, default=ANTHROPIC_BASE_URL)
-        body = self._read(
-            endpoint,
-            f"{base_url}/models",
-            {"x-api-key": endpoint.api_key, "anthropic-version": ANTHROPIC_VERSION},
+        headers = {"x-api-key": endpoint.api_key, "anthropic-version": ANTHROPIC_VERSION}
+        models: list[DiscoveredModel] = []
+        after_id: str | None = None
+        seen_cursors: set[str] = set()
+        for _ in range(_MAXIMUM_ANTHROPIC_PAGES):
+            query = [("limit", str(_ANTHROPIC_PAGE_SIZE))]
+            if after_id is not None:
+                query.append(("after_id", after_id))
+            body = self._read(endpoint, f"{base_url}/models?{urlencode(query)}", headers)
+            models.extend(
+                DiscoveredModel(provider=endpoint.provider, model=identity)
+                for identity in _identities(endpoint.provider, body.get("data"), "id")
+            )
+            has_more = body.get("has_more")
+            if not isinstance(has_more, bool):
+                raise ProviderListingError(
+                    "anthropic returned pagination without a boolean has_more"
+                )
+            if not has_more:
+                return models
+            after_id = _text(body.get("last_id"))
+            if after_id is None:
+                raise ProviderListingError(
+                    "anthropic returned more models without a non-empty last_id"
+                )
+            if after_id in seen_cursors:
+                raise ProviderListingError("anthropic returned a repeated last_id cursor")
+            seen_cursors.add(after_id)
+        raise ProviderListingError(
+            f"anthropic model listing exceeded {_MAXIMUM_ANTHROPIC_PAGES} pages"
         )
-        return [
-            DiscoveredModel(provider=endpoint.provider, model=identity)
-            for identity in _identities(endpoint.provider, body.get("data"), "id")
-        ]
 
     def _openrouter_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
         """List OpenRouter models, which publish capabilities, limits, and prices."""
@@ -204,9 +229,10 @@ class HttpProviderModelLister:
         models = []
         page_token: str | None = None
         for _ in range(_MAXIMUM_GEMINI_PAGES):
-            url = f"{base_url}/models?pageSize=200"
+            query_parameters = {"pageSize": "200"}
             if page_token is not None:
-                url = f"{url}&pageToken={page_token}"
+                query_parameters["pageToken"] = page_token
+            url = f"{base_url}/models?{urlencode(query_parameters)}"
             body = self._read(endpoint, url, headers)
             for entry in _entries(endpoint.provider, body.get("models")):
                 identity = _text(entry.get("name"))
@@ -255,6 +281,8 @@ def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) ->
         supports_top_p=_strict_bool(entry.get("supports_top_p")),
         supports_top_k=_strict_bool(entry.get("supports_top_k")),
         supports_logprobs=_strict_bool(entry.get("supports_logprobs")),
+        supports_frequency_penalty=_strict_bool(entry.get("supports_frequency_penalty")),
+        supports_presence_penalty=_strict_bool(entry.get("supports_presence_penalty")),
         supports_reasoning=_strict_bool(entry.get("supports_reasoning")),
         reasoning_effort=_reasoning_effort(entry.get("reasoning_effort")),
         sampling_requires_reasoning_none=_strict_bool(
@@ -269,14 +297,14 @@ def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) ->
         maximum_top_k=_generation_integer(entry.get("maximum_top_k")),
         context_window_tokens=_strict_positive_int(entry.get("context_window_tokens")),
         maximum_output_tokens=_strict_positive_int(entry.get("maximum_output_tokens")),
-        input_cost_per_million_tokens_usd=_micro_usd_price(
-            prices.get("input_micro_usd_per_million_tokens")
+        input_cost_per_million_tokens_usd=_nano_usd_price(
+            prices.get("input_nano_usd_per_million_tokens")
         ),
-        output_cost_per_million_tokens_usd=_micro_usd_price(
-            prices.get("output_micro_usd_per_million_tokens")
+        output_cost_per_million_tokens_usd=_nano_usd_price(
+            prices.get("output_nano_usd_per_million_tokens")
         ),
-        cached_input_cost_per_million_tokens_usd=_micro_usd_price(
-            prices.get("cached_input_micro_usd_per_million_tokens")
+        cached_input_cost_per_million_tokens_usd=_nano_usd_price(
+            prices.get("cached_input_nano_usd_per_million_tokens")
         ),
     )
 
@@ -304,6 +332,8 @@ def _openrouter_model(provider: str, identity: str, entry: JsonObject) -> Discov
         supports_top_p="top_p" in supported,
         supports_top_k="top_k" in supported,
         supports_logprobs="logprobs" in supported or "top_logprobs" in supported,
+        supports_frequency_penalty="frequency_penalty" in supported,
+        supports_presence_penalty="presence_penalty" in supported,
         supports_reasoning="reasoning" in supported,
         reasoning_effort=(
             default_reasoning_effort(identity, "reasoning") if "reasoning" in supported else None
@@ -464,11 +494,11 @@ def _generation_integer(value: object) -> int | None:
     return value if value >= 0 else None
 
 
-def _micro_usd_price(value: object) -> float | None:
-    """Convert one configured micro-USD-per-million-token price to USD.
+def _nano_usd_price(value: object) -> float | None:
+    """Convert one configured nano-USD-per-million-token price to USD.
 
     Args:
-        value: Integer micro-USD per million tokens published by the endpoint.
+        value: Integer nano-USD per million tokens published by the endpoint.
 
     Returns:
         USD per million tokens, or ``None`` when the value is absent or unusable.
@@ -477,7 +507,7 @@ def _micro_usd_price(value: object) -> float | None:
         return None
     if value < 0:
         return None
-    return value / 1_000_000
+    return value / 1_000_000_000
 
 
 def _million_token_price(value: object) -> float | None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -13,14 +14,23 @@ from unittest import mock
 
 import pytest
 
+import exp.runtime.gateway.native_bridge as native_bridge_module
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
 )
+from exp.common.models.catalog import (
+    GatewayRungDispatchPolicy,
+    load_model_catalog,
+    write_model_catalog,
+)
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
-from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
+from exp.runtime.gateway.catalog_authority import (
+    snapshot_current_catalog,
+    upsert_singleton_deployment,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayApiSurface,
@@ -46,7 +56,12 @@ from exp.runtime.gateway.native_bridge import (
 )
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.instruction_turns import (
+    HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE,
+    SYSTEM_FOLD_DISCLOSURE,
+)
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -68,6 +83,7 @@ _PublicErrorType = Literal[
     (
         ("developer_messages", "messages", "instructions", "system"),
         ("function_tools", "tools", "tools", "tools"),
+        ("forced_tool_choice", "tool_choice", "tool_choice", "tool_choice"),
         (
             "parallel_tool_calls",
             "parallel_tool_calls",
@@ -128,6 +144,121 @@ def test_internal_text_streaming_failure_has_no_fake_public_field() -> None:
         )
         assert error.detail.param == "model"
         assert "Choose a different model alias" in error.detail.message
+
+
+@pytest.mark.parametrize(
+    ("surface", "param"),
+    [
+        (GatewayApiSurface.CHAT_COMPLETIONS, "messages"),
+        (GatewayApiSurface.RESPONSES, "input"),
+        (GatewayApiSurface.MESSAGES, "messages"),
+    ],
+)
+def test_pdf_capability_errors_explain_the_document_refusal(
+    surface: GatewayApiSurface, param: str
+) -> None:
+    """A refused PDF names the conversation field and says why, on every surface."""
+    inline = _public_capability_error(
+        ProviderCapabilityError(capability="pdf_input"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    remote = _public_capability_error(
+        ProviderCapabilityError(capability="pdf_url_input"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    assert (inline.detail.param, remote.detail.param) == (param, param)
+    assert inline.detail.code == remote.detail.code == "unsupported_capability"
+    assert "cannot accept PDF document input" in inline.detail.message
+    assert "inline PDF data only" in remote.detail.message
+    assert "pdf_input" not in inline.detail.message
+
+
+@pytest.mark.parametrize(
+    ("surface", "param"),
+    [
+        (GatewayApiSurface.CHAT_COMPLETIONS, "messages"),
+        (GatewayApiSurface.RESPONSES, "input"),
+        (GatewayApiSurface.MESSAGES, "messages"),
+    ],
+)
+def test_media_handle_capability_errors_name_the_provider_holding_the_upload(
+    surface: GatewayApiSurface, param: str
+) -> None:
+    """A refused handle names the conversation field and, when known, the provider."""
+    undeclared = _public_capability_error(
+        ProviderCapabilityError(capability="media_handle_input"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    detail = (
+        "The request references media uploaded to openai, which only an openai route "
+        "can resolve, but the selected model alias routes to gemini."
+    )
+    mismatched = _public_capability_error(
+        ProviderCapabilityError(capability="media_handle_provider", detail=detail),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    generic = _public_capability_error(
+        ProviderCapabilityError(capability="media_handle_provider"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    assert (undeclared.detail.param, mismatched.detail.param) == (param, param)
+    assert undeclared.detail.code == mismatched.detail.code == "unsupported_capability"
+    assert "cannot reference media uploaded to a provider" in undeclared.detail.message
+    assert mismatched.detail.message == detail
+    assert "different provider than the selected model route" in generic.detail.message
+    assert "media_handle" not in undeclared.detail.message
+
+
+@pytest.mark.parametrize(
+    ("surface", "param"),
+    [(GatewayApiSurface.CHAT_COMPLETIONS, "messages"), (GatewayApiSurface.RESPONSES, "input")],
+)
+def test_audio_capability_error_explains_the_refusal(
+    surface: GatewayApiSurface, param: str
+) -> None:
+    """A refused clip names the conversation field and says why, on every surface."""
+    error = _public_capability_error(
+        ProviderCapabilityError(capability="audio_input"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    assert error.detail.param == param
+    assert error.detail.code == "unsupported_capability"
+    assert "cannot accept audio input" in error.detail.message
+    assert "audio_input" not in error.detail.message
+
+
+def test_forced_tool_choice_refusal_tells_the_caller_what_to_send_instead() -> None:
+    """The forced-choice refusal names the field AND the way out ('auto'), on
+    every surface: the generic "remove the unsupported field" wording left 64
+    callers in two hours (2026-09-06) with nothing actionable."""
+    for surface in (
+        GatewayApiSurface.CHAT_COMPLETIONS,
+        GatewayApiSurface.RESPONSES,
+        GatewayApiSurface.MESSAGES,
+    ):
+        error = _public_capability_error(
+            ProviderCapabilityError(capability="forced_tool_choice"),
+            surface,
+            public_stream=True,
+            public_tools=True,
+        )
+        assert error.status_code == 400
+        assert error.detail.param == "tool_choice"
+        assert error.detail.code == "unsupported_capability"
+        assert "tool_choice 'auto'" in error.detail.message
+        assert "forced_tool_choice" not in error.detail.message
 
 
 def test_public_capability_error_never_exposes_internal_labels() -> None:
@@ -202,19 +333,106 @@ def _admit(
     raw_key: str,
     body: str,
     *,
+    surface: str | None = None,
     idempotency_key: str | None = None,
     client_request_id: str | None = None,
 ) -> JsonObject:
     """Run one admission call and decode its JSON response."""
-    argument = json.dumps(
-        {
-            "raw_key": raw_key,
-            "body": body,
-            "idempotency_key": idempotency_key,
-            "client_request_id": client_request_id,
-        }
+    payload: JsonObject = {
+        "raw_key": raw_key,
+        "body": body,
+        "idempotency_key": idempotency_key,
+        "client_request_id": client_request_id,
+    }
+    if surface is not None:
+        payload["surface"] = surface
+    return json.loads(control.admit(json.dumps(payload)))
+
+
+@pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
+@pytest.mark.parametrize("maximum", (2_048, 128_000))
+def test_omitted_cap_admission_freezes_provider_maximum_without_public_rewrite(
+    tmp_path: Path, provider: str, maximum: int
+) -> None:
+    """The real admission bridge reserves the same bound its per-rung payload permits."""
+    _manager, key = _configured_gateway(
+        tmp_path,
+        provider=provider,
+        capabilities=ModelCapabilities(maximum_output_tokens=maximum),
     )
-    return json.loads(control.admit(argument))
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    admission = _admit(control, key, _chat_body())
+    assert "maximum_output_tokens" not in admission
+    route = admission["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    payload = route[0]["upstream_payload"]
+    assert isinstance(payload, dict)
+    if provider == "anthropic":
+        assert payload["max_tokens"] == maximum
+        assert admission["ignored_parameters"] == [
+            f"max_tokens->default({maximum};anthropic_messages;declared_bound)"
+        ]
+    else:
+        assert "max_tokens" not in payload
+        assert admission["ignored_parameters"] == []
+    entry = control._accounting.entry(str(admission["request_id"]))
+    assert entry is not None
+    assert entry.reserved_output_tokens_by_depth == (maximum,)
+    assert isinstance(entry.request, GatewayRequest)
+    assert entry.request.maximum_output_tokens is None
+    assert "attempt_id" in _start_first(control, admission)
+
+
+@pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
+def test_omitted_cap_with_unknown_model_bounds_is_rejected_before_an_attempt(
+    tmp_path: Path, provider: str
+) -> None:
+    """A missing cap never creates a provider attempt with an invented money bound."""
+    manager, key = _configured_gateway(
+        tmp_path, provider=provider, capabilities=ModelCapabilities()
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    with pytest.raises(NativeBridgeError, match="Supply an explicit max_tokens"):
+        _admit(control, key, _chat_body())
+    with sqlite3.connect(manager.database_path) as connection:
+        assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
+    body = json.loads(_chat_body())
+    body["max_tokens"] = 128
+    admission = _admit(control, key, json.dumps(body))
+    assert admission["maximum_output_tokens"] == 128
+    assert "attempt_id" in _start_first(control, admission)
+
+
+@pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
+def test_chat_omission_with_context_only_metadata_preserves_wire_authority(
+    tmp_path: Path, provider: str
+) -> None:
+    """Public Chat refuses to mistake a required provider's context for an output maximum."""
+    manager, key = _configured_gateway(
+        tmp_path, provider=provider, capabilities=ModelCapabilities(context_window_tokens=200_000)
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    if provider == "anthropic":
+        with pytest.raises(NativeBridgeError, match="no declared output maximum"):
+            _admit(control, key, _chat_body())
+        with sqlite3.connect(manager.database_path) as connection:
+            assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
+    else:
+        admission = _admit(control, key, _chat_body())
+        entry = control._accounting.entry(str(admission["request_id"]))
+        assert entry is not None
+        assert entry.reserved_output_tokens_by_depth == (200_000,)
+        assert "maximum_output_tokens" not in admission
+        route = admission["route"]
+        assert isinstance(route, list) and isinstance(route[0], dict)
+        payload = route[0]["upstream_payload"]
+        assert isinstance(payload, dict) and "max_tokens" not in payload
 
 
 def _claim_scope(
@@ -286,7 +504,7 @@ def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://api.fireworks.ai/inference/v1",
-        capabilities=ModelCapabilities(supports_tools=True),
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
     )
     first_control = NativeControlPlane(
         load_gateway_components(
@@ -360,6 +578,9 @@ def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
     messages = cast("list[JsonObject]", payload["messages"])
     assert continued["route_reason"] == "reasoning_continuation"
     assert messages[1]["reasoning_content"] == hidden
+    # The data plane's per-caller repair memory keys on this, never on the raw key.
+    organization, identity = str(continued["caller_scope"]).split(":", maxsplit=1)
+    assert organization and identity == "default"
 
     transplanted = json.loads(continuation_body)
     transplanted["messages"][0]["content"] = "Use this carrier under a different prompt"
@@ -398,8 +619,322 @@ def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
     assert "reasoning_content" not in rotated_messages[1]
 
 
+def test_hunyuan_tool_turn_reasoning_round_trips_as_a_sealed_carrier(
+    tmp_path: Path,
+) -> None:
+    """A Hunyuan TOOL turn round-trips its reasoning as the sealed carrier.
+
+    The rung is marked as an exposed-plaintext reasoning route on the wire (so
+    the data plane returns ``reasoning_content`` to the caller on plain turns,
+    which replay as plaintext — see the plain-turn test), while a tool turn's
+    round-trip token stays the domain-separated opaque carrier: a
+    second replica unseals the exact turn and forwards the plaintext upstream,
+    the Fireworks-only ``reasoning_history`` wire flag never appears, and a
+    tampered turn fails closed.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://api.hunyuan.cloud.tencent.com/v1",
+        capabilities=ModelCapabilities(
+            supports_tools=True, reasoning_output_exposed=True, maximum_output_tokens=128_000
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"},
+        )
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    # The rung declares plaintext exposure and a Hunyuan carrier route identity,
+    # and is not a Fireworks route.
+    assert initial["reasoning_output_exposed"] is True
+    assert initial["fireworks_reasoning_route_sha256"] is None
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    assert isinstance(route_sha256, str)
+
+    hidden = "let me reason about the tool call privately"
+    seal_argument = json.dumps(
+        {
+            "request_id": initial["request_id"],
+            "route_depth": initial["route_depth"],
+            "route_sha256": route_sha256,
+            "content": hidden,
+            "assistant_content": None,
+            "tool_calls": [{"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}],
+        }
+    )
+    sealed = json.loads(control.seal_reasoning_content(seal_argument))["carrier"]
+    # The carrier is opaque under the Hunyuan scheme and leaks neither the
+    # plaintext reasoning nor the provider credential.
+    assert sealed.startswith("x-experiential-hunyuan-reasoning-v1:")
+    assert hidden not in sealed
+    assert "shared-hunyuan-secret" not in sealed
+    assert (
+        control.settle(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "attempt_id": initial["attempt_id"],
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                    "tool_names": ["lookup"],
+                    "failure": None,
+                }
+            )
+        )
+        == "{}"
+    )
+
+    continuation_body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+    replica = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"},
+        )
+    )
+    continued = _admit(replica, raw_key, continuation_body)
+    route = cast("list[JsonObject]", continued["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    # The sealed carrier unseals to the exact plaintext forwarded upstream on the
+    # assistant turn, and Hunyuan omits the Fireworks-only reasoning_history flag.
+    assert messages[1]["reasoning_content"] == hidden
+    assert "reasoning_history" not in payload
+
+    # A tampered tool turn fails closed at the carrier authority.
+    modified_turn = json.loads(continuation_body)
+    modified_turn["messages"][1]["tool_calls"][0]["function"]["arguments"] = '{"tampered":true}'
+    with pytest.raises(NativeBridgeError) as modified:
+        _admit(replica, raw_key, json.dumps(modified_turn))
+    assert json.loads(modified.value.public_error_json)["param"] == "messages.reasoning_content"
+
+
+@pytest.mark.parametrize("thinking", ["", "The user wants a directory listing; ls is the command."])
+def test_hunyuan_plain_turn_plaintext_reasoning_replays_verbatim(
+    tmp_path: Path,
+    thinking: str,
+) -> None:
+    """A Terminus-shaped loop round-trips the plaintext the rung itself returned.
+
+    Terminus-2 parses commands out of assistant TEXT and feeds the output back
+    as a user message, so every turn is a non-tool turn: the exposing rung
+    returns plaintext ``reasoning_content`` and the caller echoes it. The
+    provider's wire accepts that text verbatim and validates nothing about it,
+    so the gateway forwards it to the exposing rung — no carrier, no route
+    pin, no disclosure.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        capabilities=ModelCapabilities(
+            supports_tools=True, reasoning_output_exposed=True, maximum_output_tokens=128_000
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "List the files."},
+                {
+                    "role": "assistant",
+                    "content": '{"command": "ls"}',
+                    "reasoning_content": thinking,
+                },
+                {"role": "user", "content": "a.txt b.txt"},
+            ],
+        }
+    )
+    admitted = _admit(control, raw_key, body)
+    route = cast("list[JsonObject]", admitted["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert messages[1]["reasoning_content"] == thinking
+    assert admitted["route_reason"] != "reasoning_continuation"
+    assert "reasoning_history" not in payload
+    assert admitted.get("ignored_parameters", []) == []
+
+
+def test_hunyuan_mixed_carrier_and_plaintext_history_round_trips(tmp_path: Path) -> None:
+    """Harbor with interleaved thinking echoes BOTH shapes and both replay.
+
+    A tool turn carries the sealed carrier (unsealed to its plaintext and
+    pinned to the issuing rung); a later plain turn carries the plaintext the
+    rung returned. One history, both forwarded verbatim.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        capabilities=ModelCapabilities(
+            supports_tools=True, reasoning_output_exposed=True, maximum_output_tokens=128_000
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    hidden = "reason about the lookup privately"
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": initial["route_depth"],
+                    "route_sha256": route_sha256,
+                    "content": hidden,
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": initial["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["lookup"],
+                "failure": None,
+            }
+        )
+    )
+    plain = "now summarize what the tool said"
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+                {"role": "assistant", "content": "It said done.", "reasoning_content": plain},
+                {"role": "user", "content": "thanks, and now?"},
+            ],
+        }
+    )
+    admitted = _admit(control, raw_key, body)
+    route = cast("list[JsonObject]", admitted["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    messages = cast("list[JsonObject]", payload["messages"])
+    # The carrier precedes the latest user turn, so it is stale history and
+    # is stripped exactly as before; the plaintext plain turn replays.
+    assert "reasoning_content" not in messages[1]
+    assert messages[3]["reasoning_content"] == plain
+
+
+@pytest.mark.parametrize("reasoning", ["", "private"])
+def test_plaintext_reasoning_degrades_on_a_route_without_exposure(
+    tmp_path: Path,
+    reasoning: str,
+) -> None:
+    """A rung that cannot replay plaintext reasoning drops it with disclosure.
+
+    The block is baked into the caller's transcript (an earlier exposed-rung
+    turn or a client re-serialization), so admission serves the request and
+    discloses the drop — previously a named 400 that killed every session
+    the moment it switched from a reasoning-exposed model to any other."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path, capabilities=ModelCapabilities(maximum_output_tokens=128_000)
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "x", "reasoning_content": reasoning},
+                {"role": "user", "content": "again"},
+            ],
+        }
+    )
+    admitted = _admit(control, raw_key, body)
+    ignored = cast("list[str]", admitted["ignored_parameters"])
+    assert "messages.reasoning_content->dropped(unsupported_by_provider)" in ignored
+    route = cast("list[JsonObject]", admitted["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    sent_messages = cast("list[JsonObject]", payload["messages"])
+    assert all("reasoning_content" not in message for message in sent_messages)
+
+
+def test_hunyuan_endpoint_without_exposure_capability_strips_reasoning(
+    tmp_path: Path,
+) -> None:
+    """A Hunyuan-endpoint rung that does not declare exposure keeps reasoning stripped.
+
+    Exposure is gated on the explicit per-rung capability, not the base URL, so a
+    model added to the Tencent endpoint without ``reasoning_output_exposed`` fails
+    closed: the data plane still recognizes the carrier route (round-trips stay
+    sealed) but never surfaces plaintext ``reasoning_content`` to the caller.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://api.hunyuan.cloud.tencent.com/v1",
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"},
+        )
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    # No exposure capability -> plaintext stays stripped even on the Hunyuan URL,
+    # while the carrier route identity still resolves so replay stays sealed.
+    assert initial["reasoning_output_exposed"] is False
+    assert isinstance(initial["hunyuan_reasoning_route_sha256"], str)
+    assert initial["fireworks_reasoning_route_sha256"] is None
+
+
 def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: Path) -> None:
-    """A fallback-issued carrier replays only to its exact deployment and credential."""
+    """A fallback-issued carrier replays only to its exact deployment and credential.
+
+    The issuing rung leads the continuation's ladder with the unsealed
+    reasoning; the pool's other rung follows as a failover fallback whose
+    frozen payload carries no reasoning at all (it cannot unseal it), so the
+    plaintext is replayed to exactly one deployment while a failure on it can
+    still be served.
+    """
     _manager, raw_key = _configured_pool_gateway(
         tmp_path,
         base_urls=(
@@ -494,8 +1029,360 @@ def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: P
     )
 
     continued_route = cast("list[JsonObject]", continuation["route"])
-    assert [item["deployment_id"] for item in continued_route] == [route[1]["deployment_id"]]
+    assert [item["deployment_id"] for item in continued_route] == [
+        route[1]["deployment_id"],
+        route[0]["deployment_id"],
+    ]
     assert continued_route[0]["model_id"] == "beta-model-exact"
+    assert continuation["route_reason"] == "reasoning_continuation"
+    issuing_payload = cast("JsonObject", continued_route[0]["upstream_payload"])
+    issuing_messages = cast("list[JsonObject]", issuing_payload["messages"])
+    assert issuing_messages[1]["reasoning_content"] == "fallback-private-reasoning"
+    assert issuing_payload["reasoning_history"] == "interleaved"
+    fallback_payload = cast("JsonObject", continued_route[1]["upstream_payload"])
+    fallback_messages = cast("list[JsonObject]", fallback_payload["messages"])
+    assert "reasoning_content" not in json.dumps(fallback_payload)
+    assert "reasoning_history" not in fallback_payload
+    assert fallback_messages[1]["tool_calls"] == issuing_messages[1]["tool_calls"]
+    assert fallback_messages[2] == issuing_messages[2]
+
+
+def _reasoning_failover_pool(
+    root: Path,
+    *,
+    issuing_requests_per_minute: int | None = None,
+) -> tuple[NativeControlPlane, str, str, list[JsonObject]]:
+    """Seal one Hunyuan tool turn on the issuing rung of a two-rung pool.
+
+    The pool's first rung is a Hunyuan carrier route (it seals and unseals
+    the reasoning under its own credential); the second is a plain
+    OpenAI-compatible rung that yields no carrier authority at all. With
+    ``issuing_requests_per_minute`` the issuing rung authors a per-worker
+    request-rate dispatch policy, the way the hosted platform authors the
+    Tencent lane, behind a fresh alias revision.
+
+    Returns:
+        The control plane, raw key, the continuation body carrying the sealed
+        carrier, and the initial admission's wire route.
+    """
+    manager, raw_key = _configured_pool_gateway(
+        root,
+        base_urls=("https://api.hunyuan.cloud.tencent.com/v1", "http://127.0.0.1:10/v1"),
+        model_capabilities=(
+            ModelCapabilities(
+                supports_tools=True, reasoning_output_exposed=True, maximum_output_tokens=128_000
+            ),
+            ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+        ),
+    )
+    if issuing_requests_per_minute is not None:
+        catalog_path = root / "models.toml"
+        catalog = load_model_catalog(catalog_path)
+        models = dict(catalog.models)
+        record = models["alpha"]
+        assert record.gateway is not None
+        models["alpha"] = record.model_copy(
+            update={
+                "gateway": record.gateway.model_copy(
+                    update={
+                        "dispatch": GatewayRungDispatchPolicy(
+                            requests_per_minute=issuing_requests_per_minute
+                        )
+                    }
+                )
+            }
+        )
+        write_model_catalog(catalog_path, catalog.model_copy(update={"models": models}))
+        _catalog, normalized, snapshot = snapshot_current_catalog(root)
+        manager.activate_direct_alias(
+            alias_id="coding",
+            alias_name="coding",
+            revision_id="revision-pool-rated",
+            pool_id="coding",
+            snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+            catalog_sha256=normalized.identity_sha256(),
+        )
+    control = NativeControlPlane(
+        load_gateway_components(root, environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    assert initial["route_depth"] == 0
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    assert isinstance(route_sha256, str)
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": 0,
+                    "route_sha256": route_sha256,
+                    "content": "private reasoning only the issuing rung can unseal",
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": initial["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["lookup"],
+                "failure": None,
+            }
+        )
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+    return control, raw_key, body, cast("list[JsonObject]", initial["route"])
+
+
+def _attempt_route_reasons(control: NativeControlPlane, request_id: str) -> list[tuple[int, str]]:
+    """Return each reserved attempt's ``(route_depth, route_reason)`` for one request."""
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
+        rows = connection.execute(
+            "select route_depth, route_reason from gateway_attempts "
+            "where request_id = ? order by attempt_ordinal",
+            (request_id,),
+        ).fetchall()
+    return [(int(depth), str(reason)) for depth, reason in rows]
+
+
+def _attempt_dispatch_reasons(control: NativeControlPlane, request_id: str) -> list[str | None]:
+    """Return each reserved attempt's ``dispatch_reason`` for one request, in order."""
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
+        rows = connection.execute(
+            "select dispatch_reason from gateway_attempts where request_id = ? "
+            "order by attempt_ordinal",
+            (request_id,),
+        ).fetchall()
+    return [None if reason is None else str(reason) for (reason,) in rows]
+
+
+def test_pinned_continuation_rate_shed_keeps_the_issuing_rung_then_fails_over(
+    tmp_path: Path,
+) -> None:
+    """A rate shed force-admits the pinned rung; only a real failure moves past it.
+
+    The issuing rung authors ``requests_per_minute: 1`` per worker (the
+    Tencent lane's shape) and the initial turn already used the window. The
+    continuation's first dispatch sheds there, yet it is force-admitted on the
+    pinned rung as ``saturated_overflow`` with the unsealed reasoning intact
+    rather than spilled sideways to the stripped fallback: a per-worker rate
+    fact trips under ordinary load and must not cost the turn's thinking. A
+    throttle on that attempt (no redial schedule, so a zero redial budget)
+    then fails over to the fallback, recorded ``reasoning_continuation_failover``
+    with its frozen payload free of any reasoning.
+    """
+    control, raw_key, body, _initial_route = _reasoning_failover_pool(
+        tmp_path, issuing_requests_per_minute=1
+    )
+    continued = _admit(control, raw_key, body)
+    route = cast("list[JsonObject]", continued["route"])
+    assert [wire["deployment_id"] for wire in route] == ["alpha", "beta"]
+    assert route[0]["throttle_redial_budget"] == 0
+    pinned_messages = cast(
+        "list[JsonObject]", cast("JsonObject", route[0]["upstream_payload"])["messages"]
+    )
+    assert (
+        pinned_messages[1]["reasoning_content"]
+        == "private reasoning only the issuing rung can unseal"
+    )
+    assert "reasoning_content" not in json.dumps(route[1]["upstream_payload"])
+
+    first = _start_first(control, continued)
+    assert first["route_depth"] == 0
+    request_id = _admitted_request_id(continued)
+    assert _attempt_dispatch_reasons(control, request_id) == ["saturated_overflow"]
+    assert _attempt_route_reasons(control, request_id) == [(0, "reasoning_continuation")]
+    assert control._accounting.rung_admission_counters() == (1, 1, 0)  # noqa: SLF001
+
+    throttled = {
+        "failure_class": "throttled",
+        "safe_message": "provider throttled the request",
+        "retryable_same_deployment": False,
+        "failover_eligible": True,
+    }
+    control.settle(
+        json.dumps(
+            {
+                "request_id": request_id,
+                "attempt_id": first["attempt_id"],
+                "outcome": "failed",
+                "usage": None,
+                "tool_names": [],
+                "failure": throttled,
+                "finalize": False,
+            }
+        )
+    )
+    second = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": throttled,
+                }
+            )
+        )
+    )
+    assert second["route_depth"] == 1
+    assert _attempt_route_reasons(control, request_id) == [
+        (0, "reasoning_continuation"),
+        (1, "reasoning_continuation_failover"),
+    ]
+
+
+def test_pinned_continuation_surfaces_a_caller_error_on_the_issuing_rung(tmp_path: Path) -> None:
+    """A non-operational failure on the pinned rung never fails over past it.
+
+    ``invalid_request`` is not failover-eligible, so the fallback rung the
+    pinned ladder now carries is never claimed: the ladder exhausts with the
+    caller's own error exactly as a one-rung pin did.
+    """
+    control, raw_key, body, _initial_route = _reasoning_failover_pool(tmp_path)
+    continued = _admit(control, raw_key, body)
+    assert [wire["deployment_id"] for wire in cast("list[JsonObject]", continued["route"])] == [
+        "alpha",
+        "beta",
+    ]
+    first = _start_first(control, continued)
+    assert first["route_depth"] == 0
+    failure = {
+        "failure_class": "invalid_request",
+        "safe_message": "the provider rejected the request",
+        "retryable_same_deployment": False,
+        "failover_eligible": False,
+    }
+    control.settle(
+        json.dumps(
+            {
+                "request_id": continued["request_id"],
+                "attempt_id": first["attempt_id"],
+                "outcome": "failed",
+                "usage": None,
+                "tool_names": [],
+                "failure": failure,
+                "finalize": False,
+            }
+        )
+    )
+    exhausted = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": continued["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": failure,
+                }
+            )
+        )
+    )
+    assert exhausted["exhausted"] is True
+    assert exhausted["failure"]["failure_class"] == "invalid_request"
+    assert _attempt_route_reasons(control, _admitted_request_id(continued)) == [
+        (0, "reasoning_continuation")
+    ]
+
+
+def test_pinned_continuation_fails_over_past_a_throttled_issuing_rung(tmp_path: Path) -> None:
+    """A throttle on the pinned rung continues on the pool's other rung without the reasoning.
+
+    Production shape (hy4-preview, 2026-09-13): the Tencent house account hit
+    its daily quota and every continuation carrying a Hunyuan carrier died
+    after one throttled attempt because its ladder had one rung. The ladder
+    now carries the pool's remaining rung: its frozen payload keeps the
+    messages, the tool call and the tool result but no sealed reasoning (the
+    plain rung could never unseal it), and the ledger records that attempt as
+    ``reasoning_continuation_failover`` beside the pinned first attempt's
+    ``reasoning_continuation``.
+    """
+    control, raw_key, body, _initial_route = _reasoning_failover_pool(tmp_path)
+    continued = _admit(control, raw_key, body)
+    route = cast("list[JsonObject]", continued["route"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    assert [wire["deployment_id"] for wire in route] == ["alpha", "beta"]
+    pinned_payload = cast("JsonObject", route[0]["upstream_payload"])
+    pinned_messages = cast("list[JsonObject]", pinned_payload["messages"])
+    assert (
+        pinned_messages[1]["reasoning_content"]
+        == "private reasoning only the issuing rung can unseal"
+    )
+    fallback_payload = cast("JsonObject", route[1]["upstream_payload"])
+    fallback_messages = cast("list[JsonObject]", fallback_payload["messages"])
+    assert "reasoning_content" not in json.dumps(fallback_payload)
+    assert "x-experiential-hunyuan-reasoning" not in json.dumps(fallback_payload)
+    assert fallback_messages[1]["tool_calls"] == pinned_messages[1]["tool_calls"]
+    assert fallback_messages[2] == {"role": "tool", "tool_call_id": "call-one", "content": "done"}
+    assert fallback_messages[0] == pinned_messages[0]
+
+    first = _start_first(control, continued)
+    assert first["route_depth"] == 0
+    throttled = {
+        "failure_class": "throttled",
+        "safe_message": "provider throttled the request",
+        "retryable_same_deployment": False,
+        "failover_eligible": True,
+    }
+    control.settle(
+        json.dumps(
+            {
+                "request_id": continued["request_id"],
+                "attempt_id": first["attempt_id"],
+                "outcome": "failed",
+                "usage": None,
+                "tool_names": [],
+                "failure": throttled,
+                "finalize": False,
+            }
+        )
+    )
+    second = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": continued["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": throttled,
+                }
+            )
+        )
+    )
+    assert second["route_depth"] == 1
+    assert _attempt_route_reasons(control, _admitted_request_id(continued)) == [
+        (0, "reasoning_continuation"),
+        (1, "reasoning_continuation_failover"),
+    ]
 
 
 def test_bridge_error_payload_is_openai_shaped() -> None:
@@ -520,6 +1407,73 @@ def test_bridge_error_payload_is_openai_shaped() -> None:
     }
 
 
+def test_admit_stamps_the_callers_output_cap(tmp_path: Path) -> None:
+    """A capped request carries its normalized cap on the admission.
+
+    The data plane reads it to tell a budget the provider's hidden reasoning
+    exhausted (a `stop` with no output and no usage on a capped request, the
+    Meta muse-spark shape) from a provider that delivered nothing at all.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    assert control.authenticate(json.dumps({"raw_key": raw_key})) == "{}"
+
+    body = json.dumps(
+        {
+            "model": "coding",
+            "max_completion_tokens": 40,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    admission = _admit_started(control, raw_key, body)
+    assert admission["maximum_output_tokens"] == 40
+
+
+def test_admit_marks_an_image_output_lane_on_the_wire(tmp_path: Path) -> None:
+    """A lane the platform marks `emits_images` rides the wire as `image_output`.
+
+    The data plane answers an empty completion on such a rung at once
+    (no redial, no ladder): the chat normalizers carry no image event, so an
+    image generation always ends output-less and a redial would bill the
+    house a second whole image (2026-09-15, gpt-5.4-image-2). The flag is
+    read from `emits_images`, never from `supports_image_generation`: that
+    claim admits /v1/images, and reusing it opened OpenRouter chat lanes to
+    image generations the same day.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path, capabilities=ModelCapabilities(emits_images=True, maximum_output_tokens=128_000)
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        )
+    )
+    assert control.authenticate(json.dumps({"raw_key": raw_key})) == "{}"
+    admission = _admit_started(control, raw_key, _chat_body())
+    assert admission["image_output"] is True
+
+    text_control, text_key = _control_plane(tmp_path / "text")
+    assert text_control.authenticate(json.dumps({"raw_key": text_key})) == "{}"
+    text_admission = _admit_started(text_control, text_key, _chat_body())
+    assert text_admission["image_output"] is False
+
+    # The Images-API claim alone does NOT mark the chat wire.
+    images_root = tmp_path / "images"
+    _manager, images_key = _configured_gateway(
+        images_root,
+        capabilities=ModelCapabilities(
+            supports_image_generation=True, maximum_output_tokens=128_000
+        ),
+    )
+    images_control = NativeControlPlane(
+        load_gateway_components(
+            images_root, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        )
+    )
+    assert images_control.authenticate(json.dumps({"raw_key": images_key})) == "{}"
+    images_admission = _admit_started(images_control, images_key, _chat_body())
+    assert images_admission["image_output"] is False
+
+
 def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     """Admission decodes the raw body, returns the shared upstream payload, and
     settlement lands in the usage report."""
@@ -542,9 +1496,14 @@ def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     assert admission["route_reason"] == "direct"
     assert admission["stream"] is False
     assert admission["include_usage"] is False
+    # An uncapped request stamps no cap: the admission stays byte-identical.
+    assert "maximum_output_tokens" not in admission
 
     decoded = decode_chat(json.loads(_chat_body()))
     provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
+    # A generic OpenAI-compatible shim never receives the cache-affinity key
+    # (only OpenAI and Tencent endpoints route by it), so the payload is the
+    # plain build.
     assert admission["upstream_payload"] == openai_compatible_stream_payload(
         "provider-model-exact", provider_request
     )
@@ -739,10 +1698,13 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
 
 def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path) -> None:
     """An admitted request the data plane never settles is closed by the sweep."""
-    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
-    abandoned = _admit_started(control, raw_key, _chat_body())
-    time.sleep(0.05)
-    with mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0):
+    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=1.0)
+    with mock.patch("exp.runtime.gateway.native_accounting.time.monotonic", return_value=100.0):
+        abandoned = _admit_started(control, raw_key, _chat_body())
+    with (
+        mock.patch("exp.runtime.gateway.native_accounting.time.monotonic", return_value=102.0),
+        mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0),
+    ):
         second = _admit(control, raw_key, _chat_body())
     assert control._accounting.entry(str(abandoned["request_id"])) is None  # noqa: SLF001
     assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
@@ -827,8 +1789,7 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
         exact_model_id="bedrock-revision-exact",
         revision=None,
         capabilities=ModelCapabilities(
-            supports_tools=True,
-            supports_structured_output=True,
+            supports_tools=True, supports_structured_output=True, maximum_output_tokens=128_000
         ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
@@ -1029,7 +1990,9 @@ def test_admit_serves_gemini_stop_and_schema_on_the_native_wire(tmp_path: Path) 
         provider_model="gemini-2.5-pro",
         exact_model_id="gemini-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(supports_structured_output=True),
+        capabilities=ModelCapabilities(
+            supports_structured_output=True, maximum_output_tokens=128_000
+        ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
             supports_stop_sequences=True,
@@ -1151,8 +2114,8 @@ def _configured_pool_gateway(
         GatewayDeploymentCapabilities(supports_streaming=True),
     )
     declared_model_capabilities = model_capabilities or (
-        ModelCapabilities(),
-        ModelCapabilities(),
+        ModelCapabilities(maximum_output_tokens=128_000),
+        ModelCapabilities(maximum_output_tokens=128_000),
     )
     for alias, base_url, gateway_capability, model_capability, api_key_env, provider_model in zip(
         ("alpha", "beta"),
@@ -1327,7 +2290,10 @@ def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
                 supports_streaming_tool_arguments=True,
                 supports_strict_tools=True,
             ),
-            (ModelCapabilities(supports_tools=True), ModelCapabilities(supports_tools=True)),
+            (
+                ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+                ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+            ),
         ),
         (
             {
@@ -1346,15 +2312,18 @@ def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
                 supports_structured_text=True,
             ),
             (
-                ModelCapabilities(supports_structured_output=True),
-                ModelCapabilities(supports_structured_output=True),
+                ModelCapabilities(supports_structured_output=True, maximum_output_tokens=128_000),
+                ModelCapabilities(supports_structured_output=True, maximum_output_tokens=128_000),
             ),
         ),
         (
             {"stream": True},
             GatewayDeploymentCapabilities(),
             GatewayDeploymentCapabilities(supports_streaming=True),
-            (ModelCapabilities(), ModelCapabilities()),
+            (
+                ModelCapabilities(maximum_output_tokens=128_000),
+                ModelCapabilities(maximum_output_tokens=128_000),
+            ),
         ),
         (
             {
@@ -1374,7 +2343,10 @@ def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
                 supports_streaming=True,
                 supports_streaming_tool_arguments=True,
             ),
-            (ModelCapabilities(supports_tools=True), ModelCapabilities(supports_tools=True)),
+            (
+                ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+                ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+            ),
         ),
     ),
 )
@@ -1412,8 +2384,8 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
         tmp_path,
         gateway_capabilities=(unsupported, unsupported),
         model_capabilities=(
-            ModelCapabilities(supports_tools=True),
-            ModelCapabilities(supports_tools=True),
+            ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+            ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
         ),
     )
     body = json.dumps(
@@ -1450,8 +2422,8 @@ def test_non_streaming_tool_transport_failure_names_tools(tmp_path: Path) -> Non
         tmp_path,
         gateway_capabilities=(unsupported, unsupported),
         model_capabilities=(
-            ModelCapabilities(supports_tools=True),
-            ModelCapabilities(supports_tools=True),
+            ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+            ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
         ),
     )
     body = json.dumps(
@@ -1513,7 +2485,7 @@ def test_admit_preserves_parameter_path_for_an_over_limit_stop_list(tmp_path: Pa
         (
             {"stop": ["DONE"]},
             GatewayDeploymentCapabilities(supports_streaming=True),
-            ModelCapabilities(),
+            ModelCapabilities(maximum_output_tokens=128_000),
             "stop",
         ),
         (
@@ -1531,7 +2503,7 @@ def test_admit_preserves_parameter_path_for_an_over_limit_stop_list(tmp_path: Pa
                 supports_streaming=True,
                 supports_structured_text=True,
             ),
-            ModelCapabilities(),
+            ModelCapabilities(maximum_output_tokens=128_000),
             "response_format",
         ),
     ),
@@ -1592,6 +2564,7 @@ def _openai_responses_pool_control_plane(
         supports_reasoning=True,
         supports_tools=True,
         supports_temperature=False,
+        maximum_output_tokens=128_000,
     )
     _manager, raw_key = _configured_pool_gateway(
         root,
@@ -1730,10 +2703,43 @@ def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
         )
     error = json.loads(rejected.value.public_error_json)
     assert error["status_code"] == 400
-    assert error["code"] == "continuation_unavailable"
+    assert error["code"] == "previous_response_not_found"
     assert error["param"] == "previous_response_id"
     assert recorded, "the unavailable continuation must record a durable failure"
     assert recorded[-1].failure_class == GatewayFailureClass.INVALID_REQUEST
+
+
+def test_admission_maps_a_route_build_failure_to_a_retryable_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A route/catalog that cannot be built during a rolling deploy records a
+    retryable UNAVAILABLE ledger failure and answers a retryable 503, never the
+    paging INTERNAL that turned the last catalog-schema roll into a fleet-wide
+    incident.
+    """
+    control, raw_key = _control_plane(tmp_path)
+
+    def _raise_routing(*_args: object, **_kwargs: object) -> object:
+        raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")
+
+    monkeypatch.setattr(control, "_resolve_route", _raise_routing)  # noqa: SLF001
+    recorded: list[GatewayFailure] = []
+    original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
+
+    def _capture(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+        recorded.append(failure)
+        return original_finish(authorization, failure)
+
+    monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture)  # noqa: SLF001
+
+    with pytest.raises(NativeBridgeError) as rejected:
+        _admit(control, raw_key, _chat_body())
+
+    error = json.loads(rejected.value.public_error_json)
+    assert error["status_code"] == 503
+    assert recorded, "the roll condition must record a durable failure"
+    assert recorded[-1].failure_class == GatewayFailureClass.UNAVAILABLE
+    assert recorded[-1].safe_message == "the gateway is updating; retry the request"
 
 
 def test_admit_skips_a_dead_lead_rung_and_serves_the_fallback(tmp_path: Path) -> None:
@@ -1951,7 +2957,7 @@ def test_admit_escalates_host_ineligible_route_and_finalizes_the_request(tmp_pat
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
     assert report["totals"]["attempts"] == 0
-    assert report["totals"]["known_estimated_cost_micro_usd"] == 0
+    assert report["totals"]["known_estimated_cost_nano_usd"] == 0
 
 
 def test_claim_scope_supports_the_responses_surface(tmp_path: Path) -> None:
@@ -2383,7 +3389,7 @@ def _activate_revision_two(root: Path, manager: GatewayManagement) -> str:
         provider_model="provider-model-next",
         exact_model_id="model-revision-next",
         revision=None,
-        capabilities=ModelCapabilities(),
+        capabilities=ModelCapabilities(maximum_output_tokens=128_000),
         gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
         prices=GatewayTokenPrices(),
         pricing_source=None,
@@ -2426,6 +3432,7 @@ def test_admission_authorized_at_the_swap_instant_stays_pinned_to_its_revision(
         deadline_monotonic: float,
         app_referer: str | None = None,
         app_title: str | None = None,
+        client_ip: str | None = None,
     ) -> AuthorizationSnapshot:
         """Mint the authorization, then stall until the activation swap lands."""
         authorization = original(
@@ -2435,6 +3442,7 @@ def test_admission_authorized_at_the_swap_instant_stays_pinned_to_its_revision(
             deadline_monotonic=deadline_monotonic,
             app_referer=app_referer,
             app_title=app_title,
+            client_ip=client_ip,
         )
         minted.set()
         assert swapped.wait(timeout=10)
@@ -2504,6 +3512,44 @@ def _settle_one_completed_chat(control: NativeControlPlane, raw_key: str) -> Non
         )
     )
     assert settled == "{}"
+
+
+def test_cache_sample_gate_reaches_accounting_through_the_control_plane(tmp_path: Path) -> None:
+    """A hosted gate forwarded at construction vets settled cache samples.
+
+    The hosted composition builds only ``NativeControlPlane``, never the
+    accounting registry directly, so the gate must ride the control plane's
+    constructor; a dropped kwarg would silently let promo-funded replay feed
+    the cache-priority EWMA.
+    """
+    gated: list[str] = []
+
+    def _gate(attempt_id: str) -> bool:
+        """Record the consulted attempt and veto its sample."""
+        gated.append(attempt_id)
+        return False
+
+    _manager, raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components, cache_sample_gate=_gate)
+    admission = _admit_started(control, raw_key, _chat_body())
+    settled = control.settle(
+        json.dumps(
+            {
+                "request_id": admission["request_id"],
+                "attempt_id": admission["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 2},
+                "tool_names": [],
+                "failure": None,
+            }
+        )
+    )
+    assert settled == "{}"
+    assert gated == [admission["attempt_id"]]
 
 
 def test_usage_callbacks_scope_reports_to_the_presented_key(tmp_path: Path) -> None:
@@ -2709,7 +3755,7 @@ def _python_responses_frames(
     body: str,
     events: list[GatewayEvent],
     *,
-    created_at: float,
+    created_at: int,
 ) -> list[str]:
     """Encode one Responses stream through the python encoder."""
     from exp.runtime.openai_protocol.streaming import ResponsesSseEncoder
@@ -2743,11 +3789,11 @@ def test_rust_responses_sse_frames_match_python_and_the_committed_golden() -> No
     native = pytest.importorskip("exp_gateway_native")
     body = _responses_body(stream=True, with_tools=True, reasoning_summary="concise")
     events, fixture = _responses_parity_case()
-    expected = _python_responses_frames(body, events, created_at=1_700_000_000.25)
+    expected = _python_responses_frames(body, events, created_at=1_700_000_000)
     actual = native.encode_responses_fixture(
         "request-abc",
         "coding",
-        1_700_000_000.25,
+        1_700_000_000,
         _native_envelope(body),
         fixture,
     )
@@ -2772,9 +3818,9 @@ def test_rust_responses_refusal_and_incomplete_match_the_committed_golden() -> N
             {"kind": "incomplete"},
         ]
     )
-    expected = _python_responses_frames(body, events, created_at=1_700_000_000.0)
+    expected = _python_responses_frames(body, events, created_at=1_700_000_000)
     actual = native.encode_responses_fixture(
-        "request-abc", "coding", 1_700_000_000.0, _native_envelope(body), fixture
+        "request-abc", "coding", 1_700_000_000, _native_envelope(body), fixture
     )
     assert list(actual) == _parity_golden("responses_refusal_frames")
     assert list(actual) == expected
@@ -2802,9 +3848,9 @@ def test_rust_responses_failed_terminal_matches_the_committed_golden() -> None:
             {"kind": "failed", "text": "provider exploded"},
         ]
     )
-    expected = _python_responses_frames(body, events, created_at=1_700_000_000.5)
+    expected = _python_responses_frames(body, events, created_at=1_700_000_000)
     actual = native.encode_responses_fixture(
-        "request-abc", "coding", 1_700_000_000.5, _native_envelope(body), fixture
+        "request-abc", "coding", 1_700_000_000, _native_envelope(body), fixture
     )
     assert list(actual) == _parity_golden("responses_failed_frames")
     assert list(actual) == expected
@@ -2826,13 +3872,13 @@ def test_rust_responses_completed_body_matches_python_and_the_committed_golden()
         request=decoded.request,
         request_id="request-abc",
         model=decoded.alias,
-        created_at=1_700_000_000.25,
+        created_at=1_700_000_000,
         events=tuple(events),
     )
     actual = native.completed_responses_fixture(
         "request-abc",
         "coding",
-        1_700_000_000.25,
+        1_700_000_000,
         _native_envelope(body),
         fixture,
     )
@@ -2848,7 +3894,7 @@ def test_rust_responses_rejects_streams_without_terminals() -> None:
     fixture = json.dumps([{"kind": "text_delta", "text": "no terminal"}])
     with pytest.raises(ValueError, match="all_routes_failed"):
         native.completed_responses_fixture(
-            "request-abc", "coding", 1_700_000_000.0, _native_envelope(body), fixture
+            "request-abc", "coding", 1_700_000_000, _native_envelope(body), fixture
         )
     malformed = json.dumps(
         [
@@ -2858,7 +3904,7 @@ def test_rust_responses_rejects_streams_without_terminals() -> None:
     )
     with pytest.raises(ValueError, match="invalid_provider_stream"):
         native.encode_responses_fixture(
-            "request-abc", "coding", 1_700_000_000.0, _native_envelope(body), malformed
+            "request-abc", "coding", 1_700_000_000, _native_envelope(body), malformed
         )
 
 
@@ -2903,21 +3949,23 @@ def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path)
     assert report["totals"]["requests"] == 1
 
 
-def test_responses_admission_rejects_unsupported_reasoning_effort(tmp_path: Path) -> None:
-    """Native admission returns the same local parameter error before Rust dispatch."""
+def test_responses_admission_drops_effort_on_a_reasoning_less_route(tmp_path: Path) -> None:
+    """A Responses effort on a zero-reasoning route serves without it, disclosed.
+
+    This surface previously answered the named 400; the owner-approved drop
+    policy (2026-09-01) serves the request effortless instead, because a
+    zero-reasoning route cannot honor any depth and first-party clients pin
+    effort globally.
+    """
     control, raw_key = _control_plane(tmp_path)
     payload = json.loads(_responses_body())
     payload["reasoning"] = {"effort": "high"}
 
-    with pytest.raises(NativeBridgeError) as raised:
-        _admit_responses(control, raw_key, json.dumps(payload))
-
-    error = json.loads(raised.value.public_error_json)
-    assert error["status_code"] == 400
-    assert error["code"] == "unsupported_parameter"
-    assert error["error_type"] == "invalid_request_error"
-    assert error["param"] == "reasoning.effort"
-    assert "not supported by this model route" in error["message"]
+    admission = _flatten_started(control, _admit_responses(control, raw_key, json.dumps(payload)))
+    assert admission["ignored_parameters"] == ["reasoning_effort"]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    assert "reasoning" not in upstream
 
 
 def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> None:
@@ -2946,7 +3994,7 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
         _admit_responses(control, raw_key, _responses_body(previous_response_id="resp_missing"))
     payload = json.loads(unknown.value.public_error_json)
     assert payload["status_code"] == 400
-    assert payload["code"] == "continuation_unavailable"
+    assert payload["code"] == "previous_response_not_found"
     assert payload["param"] == "previous_response_id"
 
     refused = _admit_responses(control, raw_key, _responses_body())
@@ -2971,7 +4019,9 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
                 previous_response_id=stable_public_id("resp", _admitted_request_id(refused))
             ),
         )
-    assert json.loads(after_refusal.value.public_error_json)["code"] == "continuation_unavailable"
+    assert (
+        json.loads(after_refusal.value.public_error_json)["code"] == "previous_response_not_found"
+    )
 
     foreign = ProtocolNamespace(
         organization_id="other-org",
@@ -2983,7 +4033,71 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
             namespace=foreign,
             previous_response_id=response_id,
         )
-    assert crossed.value.detail.code == "continuation_unavailable"
+    assert crossed.value.detail.code == "previous_response_not_found"
+
+
+def test_responses_output_less_turn_is_continuable(tmp_path: Path) -> None:
+    """A turn retained with no text, items, or calls continues as the input so far.
+
+    The data plane remembers an output-less turn (thinking exhausted the
+    budget, terminal ``incomplete``) with every retention field empty; the
+    control plane must retain the conversation rather than treat empty output
+    as nothing to remember, or the response id it already handed out dies
+    ``previous_response_not_found`` on the next turn.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    first = _admit_responses(control, raw_key, _responses_body())
+    assert (
+        control.remember(
+            json.dumps(
+                {
+                    "request_id": first["request_id"],
+                    "text": "",
+                    "message_outputs": [],
+                    "refusal": False,
+                    "encrypted_reasoning": [],
+                    "tool_calls": [],
+                }
+            )
+        )
+        == "{}"
+    )
+    response_id = stable_public_id("resp", _admitted_request_id(first))
+    second = _admit_responses(control, raw_key, _responses_body(previous_response_id=response_id))
+    assert [message["role"] for message in _payload_messages(second)] == ["user", "user"]
+
+
+def test_fallback_served_alias_continuation_degrades_to_resend_not_503(tmp_path: Path) -> None:
+    """A continuation on an alias served via its last-good fallback still fails
+    with the 400 'resend the full conversation' error when it cannot resolve —
+    never a 503. The fallback re-key is upstream of continuation binding, so it
+    adds no 5xx path; a fresh request on the same alias serves via the fallback.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    # Dead-pin the active revision so the alias is served on its last-good prior.
+    manager = GatewayManagement(tmp_path)
+    manager.activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-dead",
+        pool_id="coding",
+        snapshot_ref="catalog-snapshots/missing.json",
+        catalog_sha256="a" * 64,
+    )
+
+    # A fresh (non-continuation) Responses request still serves via the fallback.
+    served = _admit_responses(control, raw_key, _responses_body())
+    assert served["request_id"]
+
+    # A continuation whose previous_response_id cannot resolve returns the shared
+    # 400 resend error, not a 503 — confirming the re-key never turns an
+    # unresolvable continuation into a server error.
+    with pytest.raises(NativeBridgeError) as rejected:
+        _admit_responses(control, raw_key, _responses_body(previous_response_id="resp_missing"))
+    payload = json.loads(rejected.value.public_error_json)
+    assert payload["status_code"] == 400
+    assert payload["code"] == "previous_response_not_found"
+    assert payload["param"] == "previous_response_id"
 
 
 def test_responses_tool_call_retention_survives_continuation(tmp_path: Path) -> None:
@@ -3024,7 +4138,7 @@ def test_fireworks_multihop_responses_retention_stays_sealed(tmp_path: Path) -> 
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://api.fireworks.ai/inference/v1",
-        capabilities=ModelCapabilities(supports_tools=True),
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
     )
     control = NativeControlPlane(
         load_gateway_components(
@@ -3169,7 +4283,7 @@ def _configured_project_singletons(
         connection="cheap-provider",
         model="embedder-model",
         billing_source=BillingSource.CUSTOMER_MANAGED,
-        capabilities=ModelCapabilities(supports_embeddings=True),
+        capabilities=ModelCapabilities(supports_embeddings=True, maximum_output_tokens=128_000),
     )
     write_model_catalog(root / "models.toml", authored.model_copy(update={"models": models}))
     normalized = None
@@ -3182,7 +4296,7 @@ def _configured_project_singletons(
             provider_model=f"{deployment_alias}-model",
             exact_model_id="model-revision-exact",
             revision=None,
-            capabilities=ModelCapabilities(),
+            capabilities=ModelCapabilities(maximum_output_tokens=128_000),
             gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
             prices=GatewayTokenPrices(),
             pricing_source=None,
@@ -3739,7 +4853,7 @@ def test_rust_messages_interleaved_parallel_tools_match_the_goldens() -> None:
 
 def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
     """A store:false response is never remembered, so continuing from it fails
-    closed with the shared continuation_unavailable error."""
+    closed with the shared previous_response_not_found error."""
     control, raw_key = _control_plane(tmp_path)
     first = _admit_responses(control, raw_key, _responses_body(store=False))
     assert (
@@ -3759,7 +4873,7 @@ def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
     with pytest.raises(NativeBridgeError) as raised:
         _admit_responses(control, raw_key, _responses_body(previous_response_id=response_id))
     payload = json.loads(raised.value.public_error_json)
-    assert payload["code"] == "continuation_unavailable"
+    assert payload["code"] == "previous_response_not_found"
 
     # An explicit store:true keeps the default retention behavior.
     stored = _admit_responses(control, raw_key, _responses_body(store=True))
@@ -3852,7 +4966,7 @@ def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -
     body = native.completed_responses_fixture(
         "request-abc",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         json.dumps({"include_encrypted_reasoning": True}),
         fixture,
     )
@@ -3983,7 +5097,7 @@ def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None
         native.completed_responses_fixture(
             "request-abc",
             "coding",
-            1_700_000_000.0,
+            1_700_000_000,
             json.dumps({"include_encrypted_reasoning": True}),
             fixture,
         )
@@ -3993,7 +5107,7 @@ def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None
     frames = native.encode_responses_fixture(
         "request-abc",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         json.dumps({"include_encrypted_reasoning": True}),
         fixture,
     )
@@ -4010,7 +5124,7 @@ def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None
 def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) -> None:
     """An Idempotency-Key on a store:false request opens no side door into
     continuation state: the retention callback stays a no-op, the response ID
-    resolves to continuation_unavailable in its own namespace, and keyed
+    resolves to previous_response_not_found in its own namespace, and keyed
     admission replays the operation without manufacturing stored history."""
     control, raw_key = _control_plane(tmp_path)
     body = _responses_body(store=False)
@@ -4051,7 +5165,7 @@ def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) 
             namespace=entry.continuation.namespace,
             previous_response_id=response_id,
         )
-    assert direct.value.detail.code == "continuation_unavailable"
+    assert direct.value.detail.code == "previous_response_not_found"
     # Continuing from the ID through the public path fails closed too, with
     # or without the original caller operation key.
     for key in (None, "codex-op-next"):
@@ -4066,7 +5180,9 @@ def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) 
                     }
                 )
             )
-        assert json.loads(continued.value.public_error_json)["code"] == "continuation_unavailable"
+        assert (
+            json.loads(continued.value.public_error_json)["code"] == "previous_response_not_found"
+        )
 
 
 def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:
@@ -4125,9 +5241,24 @@ def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:
     assert json.loads(repeated.value.public_error_json)["code"] != "idempotency_conflict"
 
 
-def test_capability_rejection_names_the_public_request_field(tmp_path: Path) -> None:
-    """A pre-dispatch capability rejection names the exact public field."""
+def test_capability_rejection_names_the_public_request_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-dispatch capability rejection names the exact public field.
+
+    Both the caller's 400 and the ledger row name it: an alert that only
+    read "cannot preserve a requested capability" could not be triaged
+    without opening the request.
+    """
     control, raw_key = _control_plane(tmp_path)
+    recorded: list[GatewayFailure] = []
+    original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
+
+    def _capture_finish(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+        recorded.append(failure)
+        return original_finish(authorization, failure)
+
+    monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture_finish)  # noqa: SLF001
     body = json.dumps(
         {
             "model": "coding",
@@ -4151,6 +5282,12 @@ def test_capability_rejection_names_the_public_request_field(tmp_path: Path) -> 
     assert "'input.0.role'" in payload["message"]
     assert "developer_messages" not in payload["message"]
     assert "canary" not in json.dumps(payload)
+    assert recorded, "the rejection records a durable failure"
+    ledger = recorded[-1]
+    assert ledger.failure_class == GatewayFailureClass.UNSUPPORTED_CAPABILITY
+    assert ledger.safe_message.endswith("(field: input.0.role)")
+    assert "developer_messages" not in ledger.safe_message
+    assert "canary" not in ledger.safe_message
 
 
 def test_reasoning_context_reflects_in_the_envelope_only_when_sent() -> None:
@@ -4245,7 +5382,7 @@ def test_zero_argument_tool_calls_encode_on_every_public_lane() -> None:
     )
     assert streamed_arguments == "{}"
     responses_body = json.loads(
-        native.completed_responses_fixture("request-abc", "coding", 1_700_000_000.0, "{}", fixture)
+        native.completed_responses_fixture("request-abc", "coding", 1_700_000_000, "{}", fixture)
     )
     call_items = [item for item in responses_body["output"] if item["type"] == "function_call"]
     assert call_items[0]["arguments"] == "{}"
@@ -4291,16 +5428,17 @@ def test_strict_tools_degrade_with_disclosure_when_no_rung_declares_them(
     assert control_plane["admission_parameter_coercions"] == 1
 
 
-def test_effort_none_drops_with_disclosure_on_a_reasoning_less_route(
+def test_any_effort_drops_with_disclosure_on_a_reasoning_less_route(
     tmp_path: Path,
 ) -> None:
-    """reasoning_effort none is satisfied by a non-reasoning route.
+    """Every effort level is dropped with disclosure by a non-reasoning route.
 
-    The kimi-k3 shape: a route whose rungs declare no reasoning support
-    rejected the parameter wholesale. An explicit 'none' now drops with
-    disclosure (the model already does exactly what none asks for), while a
-    real effort stays the named rejection because deleting the feature is
-    not a nearest supported level.
+    The kimi-k3 shape dropped only an explicit 'none'; the haiku-4.5 shape
+    proved a real effort must drop too. First-party clients pin effort
+    globally (Claude Code sends its configured effortLevel to every model),
+    so a named rejection made whole sessions unusable against non-reasoning
+    models the provider itself serves fine without the parameter (owner
+    decision, 2026-09-01).
     """
     control, raw_key = _control_plane(tmp_path)
 
@@ -4314,18 +5452,1190 @@ def test_effort_none_drops_with_disclosure_on_a_reasoning_less_route(
             }
         )
 
-    admission = _flatten_started(control, _admit(control, raw_key, chat_body("none")))
+    for attempt, effort in enumerate(("none", "high"), start=1):
+        admission = _flatten_started(control, _admit(control, raw_key, chat_body(effort)))
+        assert admission["ignored_parameters"] == ["reasoning_effort"], effort
+        upstream = admission["upstream_payload"]
+        assert isinstance(upstream, dict)
+        assert "reasoning_effort" not in upstream
+        assert "reasoning" not in upstream
+        control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
+        assert control_plane["admission_parameter_coercions"] == attempt
+
+
+def test_effort_carrying_marked_request_serves_native_with_caching_intact(
+    tmp_path: Path,
+) -> None:
+    """The haiku-4.5 regression: effort drops, cache markers reach the wire.
+
+    A Claude Code session pinning effortLevel against a non-reasoning
+    Anthropic model must serve on the native rung with its prompt-cache
+    markers preserved and the dropped effort disclosed, not 400 and not
+    narrow onto a marker-dropping shim.
+    """
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(root, provider="anthropic")
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components, request_timeout_seconds=120.0)
+    body = json.dumps(
+        {
+            "model": "coding",
+            "max_tokens": 32,
+            "system": [
+                {"type": "text", "text": "You are terse."},
+                {
+                    "type": "text",
+                    "text": "Big cached block.",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "high"},
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, body, surface="messages"))
     assert admission["ignored_parameters"] == ["reasoning_effort"]
     upstream = admission["upstream_payload"]
     assert isinstance(upstream, dict)
+    # The dropped effort reaches the provider through NO channel.
+    assert "output_config" not in upstream
     assert "reasoning_effort" not in upstream
-    assert "reasoning" not in upstream
-    control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
-    assert control_plane["admission_parameter_coercions"] == 1
+    # The cache markers survive to the native wire, block structure intact.
+    system = cast("list[JsonObject]", upstream["system"])
+    assert system[-1]["cache_control"] == {"type": "ephemeral"}
 
-    with pytest.raises(NativeBridgeError) as raised:
-        _admit(control, raw_key, chat_body("high"))
-    payload = json.loads(raised.value.public_error_json)
-    assert payload["status_code"] == 400
-    assert payload["param"] == "reasoning_effort"
-    assert payload["code"] == "unsupported_parameter"
+
+def test_adaptive_hint_can_drop_on_nonreasoning_but_a_numeric_budget_cannot(
+    tmp_path: Path,
+) -> None:
+    """A nonreasoning route may drop an adaptive hint, never an explicit budget."""
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(root, provider="anthropic")
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components, request_timeout_seconds=120.0)
+    body = json.dumps(
+        {
+            "model": "coding",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, body, surface="messages"))
+    assert admission["ignored_parameters"] == [
+        "reasoning_effort",
+        "thinking->dropped(unsupported_by_route)",
+    ]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    assert "thinking" not in upstream
+    assert "output_config" not in upstream
+
+    budgeted = json.dumps(
+        {
+            "model": "coding",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "output_config": {"effort": "high"},
+        }
+    )
+    with pytest.raises(NativeBridgeError, match="output_config.effort"):
+        _admit(control, raw_key, budgeted, surface="messages")
+
+
+def test_open_response_format_schema_closes_on_an_anthropic_rung(tmp_path: Path) -> None:
+    """A Chat response_format schema without additionalProperties false serves.
+
+    The Anthropic validator rejects open objects that OpenAI accepts, so the
+    gateway closes every object on the wire and discloses the tightening
+    instead of relaying a post-dispatch 400.
+    """
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    manager, raw_key = _configured_gateway(root, provider="anthropic")
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        root,
+        deployment_alias="structured",
+        connection_name="provider-main",
+        provider_model="provider-model-structured",
+        exact_model_id="structured-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(
+            supports_structured_output=True, maximum_output_tokens=128_000
+        ),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_structured_text=True,
+        ),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="structured",
+        alias_name="structured",
+        revision_id="revision-structured",
+        pool_id="structured",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="structured")
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components, request_timeout_seconds=120.0)
+    body = json.dumps(
+        {
+            "model": "structured",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "geo": {
+                                "type": "object",
+                                "properties": {"lat": {"type": "number"}},
+                            },
+                        },
+                        "required": ["city", "geo"],
+                    },
+                },
+            },
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, body))
+    assert admission["ignored_parameters"] == [
+        "json_schema.additionalProperties->false",
+        "max_tokens->default(128000;anthropic_messages;declared_bound)",
+    ]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    output_config = cast("JsonObject", upstream["output_config"])
+    schema_format = cast("JsonObject", output_config["format"])
+    schema = cast("JsonObject", schema_format["schema"])
+    assert schema["additionalProperties"] is False
+    properties = cast("JsonObject", schema["properties"])
+    geo = cast("JsonObject", properties["geo"])
+    assert geo["additionalProperties"] is False
+    assert schema["required"] == ["city", "geo"]
+
+
+def _web_search_fixture_json() -> str:
+    """One WebSearch event stream in the fixture-event vocabulary."""
+    result_block = (
+        '{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1",'
+        '"content":[{"type":"web_search_result","encrypted_content":"Et8Q"}],'
+        '"caller":{"type":"direct"}}'
+    )
+    citation = '{"type":"web_search_result_location","cited_text":"3.14.7"}'
+    return json.dumps(
+        [
+            {
+                "kind": "server_tool_use_started",
+                "index": 0,
+                "call_id": "srvtoolu_1",
+                "name": "web_search",
+            },
+            {"kind": "server_tool_arguments_delta", "index": 0, "text": '{"query": "python"}'},
+            {
+                "kind": "server_tool_use_completed",
+                "index": 0,
+                "call_id": "srvtoolu_1",
+                "name": "web_search",
+                "raw_arguments": '{"query": "python"}',
+            },
+            {"kind": "server_tool_result", "index": 1, "block": result_block},
+            {"kind": "text_block_started", "index": 2},
+            {"kind": "citation_delta", "index": 2, "citation": citation},
+            {"kind": "text_delta", "text": "It is 3.14.7."},
+            {"kind": "usage", "input_tokens": 12284, "output_tokens": 103},
+            {"kind": "completed"},
+        ]
+    )
+
+
+def test_rust_messages_streams_server_tool_blocks_intact() -> None:
+    """Server tool events stream back as their native Anthropic blocks."""
+    native = pytest.importorskip("exp_gateway_native")
+
+    frames = list(
+        native.encode_messages_fixture("request-abc", "coding", _web_search_fixture_json())
+    )
+    joined = "".join(frames)
+    assert '"type":"server_tool_use","id":"srvtoolu_1","name":"web_search"' in joined
+    assert '"type":"web_search_tool_result"' in joined
+    assert '"caller":{"type":"direct"}' in joined
+    assert '"type":"citations_delta"' in joined
+    # Provider-executed tool use never becomes the tool_use stop reason.
+    assert '"stop_reason":"end_turn"' in joined
+
+
+def test_rust_messages_completed_body_carries_server_tool_blocks() -> None:
+    """The non-streaming aggregation keeps every server-tool block in order."""
+    native = pytest.importorskip("exp_gateway_native")
+
+    body = json.loads(
+        native.completed_messages_fixture("request-abc", "coding", _web_search_fixture_json())
+    )
+    kinds = [block["type"] for block in body["content"]]
+    assert kinds == ["server_tool_use", "web_search_tool_result", "text"]
+    assert body["content"][2]["citations"] == [
+        {"type": "web_search_result_location", "cited_text": "3.14.7"}
+    ]
+    assert body["stop_reason"] == "end_turn"
+
+
+def test_rust_messages_paused_turn_keeps_its_stop_reason() -> None:
+    """A pause_turn terminal survives to the caller instead of end_turn."""
+    native = pytest.importorskip("exp_gateway_native")
+
+    fixture = json.dumps(
+        [
+            {"kind": "text_delta", "text": "searching"},
+            {"kind": "paused_turn"},
+        ]
+    )
+    frames = "".join(native.encode_messages_fixture("request-abc", "coding", fixture))
+    assert '"stop_reason":"pause_turn"' in frames
+    body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
+    assert body["stop_reason"] == "pause_turn"
+
+
+def test_internal_admission_failures_log_the_real_exception(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sanitized 500 hides the cause everywhere else, so the bridge logs it once.
+
+    A granted alias whose admission blew up with an unexpected exception used
+    to fail 500 with the traceback recorded nowhere (public error, ledger row,
+    and worker log all carry only the sanitized text). The record names the
+    request and alias and carries the exception on ``exc_info``.
+    """
+    control, raw_key = _pool_control_plane(tmp_path)
+
+    def explode(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        message = "hydrated snapshot names a deployment this worker never registered"
+        raise KeyError(message)
+
+    monkeypatch.setattr(native_bridge_module, "resolve_admission_route", explode)
+    body = json.dumps({"model": "coding", "messages": [{"role": "user", "content": "hi"}]})
+
+    with (
+        caplog.at_level(logging.ERROR, logger="exp.runtime.gateway.native_bridge"),
+        pytest.raises(NativeBridgeError) as raised,
+    ):
+        _admit(control, raw_key, body)
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["status_code"] == 500
+    assert error["code"] == "internal_error"
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "gateway admission failed before provider dispatch"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.exc_info is not None
+    assert record.exc_info[0] is KeyError
+    # ``extra`` fields land on the record's namespace, not on the typed class.
+    fields = record.__dict__
+    assert fields["alias"] == "coding"
+    assert str(fields["request_id"]).startswith("request-")
+    assert fields["exception_type"] == "KeyError"
+    assert fields["operation"] == "native_admit"
+
+
+def _affinity_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str, Path]:
+    """Load the control plane over a pool opted into cache-affinity routing.
+
+    Seeds the standard certified two-deployment pool, then authors the opt-in
+    the way the hosted platform does: the pool's ``failover_mode`` flips to
+    ``maximize_cache_affinity`` and each rung carries an affinity weight in
+    its dispatch policy, all as catalog data behind a fresh alias revision.
+    """
+    from exp.common.models.catalog import (
+        GatewayRungDispatchPolicy,
+        load_model_catalog,
+        write_model_catalog,
+    )
+    from exp.runtime.gateway.catalog_authority import snapshot_current_catalog
+
+    manager, raw_key = _configured_pool_gateway(root)
+    catalog_path = root / "models.toml"
+    catalog = load_model_catalog(catalog_path)
+    weighted_models = dict(catalog.models)
+    for alias, weight in (("alpha", 1.0), ("beta", 6.0)):
+        record = weighted_models[alias]
+        assert record.gateway is not None
+        weighted_models[alias] = record.model_copy(
+            update={
+                "gateway": record.gateway.model_copy(
+                    update={"dispatch": GatewayRungDispatchPolicy(affinity_weight=weight)}
+                )
+            }
+        )
+    pool = catalog.gateway_pools["coding"].model_copy(
+        update={"failover_mode": "maximize_cache_affinity"}
+    )
+    write_model_catalog(
+        catalog_path,
+        catalog.model_copy(update={"models": weighted_models, "gateway_pools": {"coding": pool}}),
+    )
+    _catalog, normalized, snapshot = snapshot_current_catalog(root)
+    manager.activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-pool-affinity",
+        pool_id="coding",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    return NativeControlPlane(components), raw_key, manager.database_path
+
+
+def test_affinity_pool_routes_each_session_deterministically(tmp_path: Path) -> None:
+    """One session always admits the same rendezvous ladder, disclosed as such.
+
+    Three admissions of one session id produce byte-identical route orders,
+    distinct sessions reach distinct first rungs (the whole point of spreading
+    by fingerprint), the 6x-weighted rung carries the clear majority, and the
+    reserved first dispatch lands durable ``dispatch_reason='affinity'``.
+    """
+    import sqlite3
+
+    control, raw_key, database_path = _affinity_pool_control_plane(tmp_path)
+    body = json.dumps({"model": "coding", "messages": [{"role": "user", "content": "hi"}]})
+
+    def admitted_order(session: str) -> tuple[str, ...]:
+        """Admit one request under a session id and name its rung order."""
+        admission = _admit(control, raw_key, body, client_request_id=session)
+        route = admission["route"]
+        assert isinstance(route, list)
+        return tuple(str(cast("JsonObject", entry)["deployment_id"]) for entry in route)
+
+    assert len({admitted_order("session-pinned") for _ in range(3)}) == 1
+    first_rungs = [admitted_order(f"session-{index}")[0] for index in range(24)]
+    assert set(first_rungs) == {"alpha", "beta"}
+    assert first_rungs.count("beta") > first_rungs.count("alpha")
+
+    admission = _admit(control, raw_key, body, client_request_id="session-disclosed")
+    started = _start_first(control, admission)
+    assert started["route_depth"] == 0
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT dispatch_reason, preferred_deployment_id FROM gateway_attempts"
+            " WHERE attempt_id = ?",
+            (str(started["attempt_id"]),),
+        ).fetchone()
+    assert row == ("affinity", None)
+
+
+def test_foundry_deepseek_zero_argument_call_with_a_stray_empty_string_delta_completes() -> None:
+    """The captured Azure Foundry DeepSeek zero-argument tool stream completes as ``{}``.
+
+    Live wire of 2026-09-10 (ids redacted): after ``arguments: ""`` and ``{}`` the
+    shim streams one more argument delta whose text is two quote characters. Verbatim
+    assembly is ``{}""`` and failed 222 production attempts in one day as
+    ``malformed_response`` ("trailing characters at line 1 column 3 (4 bytes)"). The
+    stray delta is content-free, so it is withheld from the caller and the call
+    completes; the deltas a client sees concatenate to exactly the completed bytes.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    head = (
+        '{"id":"chatcmpl-redacted","object":"chat.completion.chunk","created":1789000000,'
+        '"model":"DeepSeek-V4-Flash","choices":[{"index":0,"delta":'
+    )
+    tail = ',"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}'
+    tool = '{"id":null,"index":0,"type":"function","function":{"name":null,"arguments":%s}}'
+    deltas = [
+        '{"reasoning_content":null,"role":"assistant","content":""}',
+        '{"role":null,"content":"\\n\\n","reasoning_content":null,"tool_calls":null}',
+        '{"role":null,"content":null,"reasoning_content":null,"tool_calls":[{"id":"call_redacted",'
+        '"index":0,"type":"function","function":{"name":"view_agent_graph","arguments":""}}]}',
+        '{"role":null,"content":null,"reasoning_content":null,"tool_calls":['
+        + tool % '"{}"'
+        + "]}",
+        '{"role":null,"content":null,"reasoning_content":null,"tool_calls":['
+        + tool % '"\\"\\""'
+        + "]}",
+    ]
+    frames = [f"data: {head}{delta}{tail}\n\n" for delta in deltas]
+    frames.append(
+        'data: {"id":"chatcmpl-redacted","object":"chat.completion.chunk","created":1789000000,'
+        '"model":"DeepSeek-V4-Flash","choices":[{"index":0,"delta":{"reasoning_content":null},'
+        '"logprobs":null,"finish_reason":"tool_calls","matched_stop":1}]}\n\n'
+    )
+    frames.append("data: [DONE]\n\n")
+    # The fixture boundary carries raw stream bytes as latin-1 code points.
+    normalized = json.loads(
+        native.normalize_stream_fixture(
+            "openai_compatible",
+            json.dumps([frame.encode().decode("latin-1") for frame in frames]),
+        )
+    )
+    assert normalized["failure"] is None
+    events = normalized["events"]
+    shown = "".join(event["text"] for event in events if event["kind"] == "tool_arguments_delta")
+    assert shown == "{}"
+    completed = [event for event in events if event["kind"] == "tool_call_completed"]
+    assert [(event["name"], event["raw_arguments"]) for event in completed] == [
+        ("view_agent_graph", "{}")
+    ]
+    assert events[-1]["kind"] == "completed"
+
+
+def test_reasoning_content_native_rung_round_trips_preserved_thinking_off_the_tencent_hosts(
+    tmp_path: Path,
+) -> None:
+    """A self-hosted hy4-preview rung keeps Tencent's preserved-thinking contract.
+
+    Carrier eligibility is the rung's ``reasoning_content_native`` declaration,
+    not the origin hostname: on an arbitrary https origin the flagged rung
+    exposes plaintext, seals a tool turn's reasoning as the Hunyuan carrier, a
+    second replica unseals and forwards it, and a plain turn's plaintext
+    replays verbatim. The same origin without the flag stays stripped.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://hy4-preview--serve.modal.run/v1",
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000,
+            supports_tools=True,
+            reasoning_output_exposed=True,
+            reasoning_content_native=True,
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    assert initial["reasoning_output_exposed"] is True
+    assert initial["fireworks_reasoning_route_sha256"] is None
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    assert isinstance(route_sha256, str)
+
+    hidden = "reason privately about the lookup"
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": initial["route_depth"],
+                    "route_sha256": route_sha256,
+                    "content": hidden,
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    assert sealed.startswith("x-experiential-hunyuan-reasoning-v1:")
+    assert hidden not in sealed
+    assert (
+        control.settle(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "attempt_id": initial["attempt_id"],
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                    "tool_names": ["lookup"],
+                    "failure": None,
+                }
+            )
+        )
+        == "{}"
+    )
+    replica = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
+    )
+    continued = _admit(
+        replica,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": sealed,
+                        "tool_calls": [
+                            {
+                                "id": "call-one",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+                ],
+            }
+        ),
+    )
+    route = cast("list[JsonObject]", continued["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    assert messages[1]["reasoning_content"] == hidden
+    assert "reasoning_history" not in payload
+
+    plain = _admit(
+        replica,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "user", "content": "List the files."},
+                    {
+                        "role": "assistant",
+                        "content": '{"command": "ls"}',
+                        "reasoning_content": "ls lists the directory.",
+                    },
+                    {"role": "user", "content": "a.txt"},
+                ],
+            }
+        ),
+    )
+    plain_payload = cast(
+        "JsonObject", cast("list[JsonObject]", plain["route"])[0]["upstream_payload"]
+    )
+    plain_messages = cast("list[JsonObject]", plain_payload["messages"])
+    assert plain_messages[1]["reasoning_content"] == "ls lists the directory."
+    assert plain.get("ignored_parameters", []) == []
+
+
+def test_an_unflagged_self_hosted_rung_stays_stripped_with_no_carrier_route(
+    tmp_path: Path,
+) -> None:
+    """Without ``reasoning_content_native`` an arbitrary origin has no preserved thinking."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://hy4-preview--serve.modal.run/v1",
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000, supports_tools=True, reasoning_output_exposed=True
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    assert initial["reasoning_output_exposed"] is False
+    assert initial["hunyuan_reasoning_route_sha256"] is None
+    assert initial["fireworks_reasoning_route_sha256"] is None
+
+
+def _messages_body(messages: list[JsonObject]) -> str:
+    """Return one raw Anthropic Messages request body over ``messages``."""
+    return json.dumps({"model": "coding", "max_tokens": 64, "messages": messages})
+
+
+def test_hunyuan_plain_turn_unsigned_thinking_replays_verbatim_on_messages(
+    tmp_path: Path,
+) -> None:
+    """Claude Code echoes the gateway's unsigned thinking block; the rung gets its text back.
+
+    The Messages surface returns an exposing rung's plaintext reasoning as a
+    thinking block with an EMPTY signature. Claude Code replays every content
+    block verbatim, so the next turn carries that block back, and admission
+    forwards the text as ``reasoning_content`` exactly like the Chat wire's
+    plaintext (see ``test_hunyuan_plain_turn_plaintext_reasoning_replays_verbatim``).
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000, supports_tools=True, reasoning_output_exposed=True
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    thinking = "The user wants a directory listing; ls is the command."
+    body = _messages_body(
+        [
+            {"role": "user", "content": "List the files."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": thinking, "signature": ""},
+                    {"type": "text", "text": '{"command": "ls"}'},
+                ],
+            },
+            {"role": "user", "content": "a.txt b.txt"},
+        ]
+    )
+    admitted = _admit(control, raw_key, body, surface="messages")
+    messages = _payload_messages(admitted)
+    assert messages[1]["reasoning_content"] == thinking
+    assert admitted["route_reason"] != "reasoning_continuation"
+    assert admitted.get("ignored_parameters", []) == []
+
+
+def test_hunyuan_tool_turn_redacted_carrier_round_trips_on_messages(tmp_path: Path) -> None:
+    """A Messages tool turn replays its sealed carrier from the redacted_thinking block.
+
+    The data plane closes a tool turn with one ``redacted_thinking`` block whose
+    data is the sealed Hunyuan carrier (beside the unsigned display block that
+    streamed live). Claude Code echoes both; admission unseals the carrier to the
+    exact plaintext, forwards it upstream, pins the issuing rung, and drops the
+    display duplicate rather than sending the text twice.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000, supports_tools=True, reasoning_output_exposed=True
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    hidden = "let me reason about the tool call privately"
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": initial["route_depth"],
+                    "route_sha256": route_sha256,
+                    "content": hidden,
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": initial["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["lookup"],
+                "failure": None,
+            }
+        )
+    )
+    body = _messages_body(
+        [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": hidden, "signature": ""},
+                    {"type": "tool_use", "id": "call-one", "name": "lookup", "input": {}},
+                    {"type": "redacted_thinking", "data": sealed},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call-one", "content": "done"}],
+            },
+        ]
+    )
+    continued = _admit(control, raw_key, body, surface="messages")
+    messages = _payload_messages(continued)
+    assert continued["route_reason"] == "reasoning_continuation"
+    assert messages[1]["reasoning_content"] == hidden
+    tool_calls = messages[1]["tool_calls"]
+    assert isinstance(tool_calls, list)
+    first_call = tool_calls[0]
+    assert isinstance(first_call, dict)
+    assert first_call["id"] == "call-one"
+
+    # A tampered tool turn fails closed at the carrier authority, as on Chat.
+    tampered = json.loads(body)
+    tampered["messages"][1]["content"][1]["input"] = {"tampered": True}
+    with pytest.raises(NativeBridgeError):
+        _admit(control, raw_key, json.dumps(tampered), surface="messages")
+
+
+def test_claude_code_tool_continuation_with_trailing_system_reminder_serves_on_messages(
+    tmp_path: Path,
+) -> None:
+    """Claude Code's exact replay of a gateway tool turn is admitted, carrier and all.
+
+    Claude Code 2.1 (``mid-conversation-system`` beta) replays the tool turn's
+    blocks as ``[thinking, text, redacted_thinking, tool_use]`` and closes the
+    continuation with a ``system`` message carrying its token budget AFTER the
+    ``tool_result`` turn. The window after the last user turn therefore ends on
+    ``system``; every carrier-bound call has its result, so the carrier unseals,
+    pins the issuing rung, and the reminder forwards in place. Harbor's hy4
+    rollouts died on this shape at their first thinking turn (965 refusals in
+    seven hours on 2026-09-12).
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000, supports_tools=True, reasoning_output_exposed=True
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    hidden = "I should read the file first."
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": initial["route_depth"],
+                    "route_sha256": initial["hunyuan_reasoning_route_sha256"],
+                    "content": hidden,
+                    "assistant_content": "Reading the file.",
+                    "tool_calls": [{"call_id": "toolu_01", "name": "Read", "raw_arguments": "{}"}],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": initial["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["Read"],
+                "failure": None,
+            }
+        )
+    )
+    body = _messages_body(
+        [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": hidden, "signature": ""},
+                    {"type": "text", "text": "Reading the file."},
+                    {"type": "redacted_thinking", "data": sealed},
+                    {"type": "tool_use", "id": "toolu_01", "name": "Read", "input": {}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_01", "content": "done"}],
+            },
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<total_tokens>100</total_tokens>",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+        ]
+    )
+    continued = _admit(control, raw_key, body, surface="messages")
+    assert continued["route_reason"] == "reasoning_continuation"
+    messages = _payload_messages(continued)
+    assert messages[1]["reasoning_content"] == hidden
+    assert messages[1]["content"] == "Reading the file."
+    assert messages[2] == {"role": "tool", "content": "done", "tool_call_id": "toolu_01"}
+    assert messages[3] == {"role": "system", "content": "<total_tokens>100</total_tokens>"}
+
+    # Dropping the tool result leaves the carrier-bound call unanswered: the
+    # continuation is refused however the caller closes the request.
+    unanswered = json.loads(body)
+    del unanswered["messages"][2]
+    with pytest.raises(NativeBridgeError) as refused:
+        _admit(control, raw_key, json.dumps(unanswered), surface="messages")
+    assert "complete tool results" in refused.value.public_error_json
+
+
+def test_anthropic_signed_thinking_drops_with_disclosure_on_a_foreign_route(
+    tmp_path: Path,
+) -> None:
+    """A Claude-signed thinking history reaching a non-Anthropic rung serves, disclosed.
+
+    Claude Code carries Claude's signed blocks into every later turn of a
+    session; pointing that session at a Tencent/OpenAI model used to answer a
+    named 400 on every request (2,180 refusals on one alias in 14 days). The
+    blocks are stripped for the foreign wire with the same disclosure shape
+    plaintext reasoning uses, and the turn serves.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000, supports_tools=True, reasoning_output_exposed=True
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    body = _messages_body(
+        [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "claude reasoned", "signature": "sig=="},
+                    {"type": "redacted_thinking", "data": "opaque=="},
+                    {"type": "text", "text": "prior answer"},
+                ],
+            },
+            {"role": "user", "content": "again"},
+        ]
+    )
+    admitted = _admit(control, raw_key, body, surface="messages")
+    ignored = cast("list[str]", admitted["ignored_parameters"])
+    assert "messages.thinking->dropped(unsupported_by_provider)" in ignored
+    messages = _payload_messages(admitted)
+    assert messages[1]["content"] == "prior answer"
+    assert "reasoning_content" not in messages[1]
+
+
+def test_count_tokens_estimates_without_accepting_a_request(tmp_path: Path) -> None:
+    """``count_tokens`` answers Anthropic's shape from the counted prompt and writes no row.
+
+    The count is the gateway's own tokenizer estimate (there is no Anthropic
+    tokenizer authority for a foreign rung), disclosed through the shared
+    ignored-parameters body field, and it never accepts a request or reserves
+    an attempt: the usage report stays empty.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    # Anthropic's count body carries no max_tokens (Claude Code sends
+    # model + messages + system + tools).
+    body = json.dumps(
+        {"model": "coding", "messages": [{"role": "user", "content": "Hello, world!"}]}
+    )
+    counted = json.loads(control.count_tokens(json.dumps({"raw_key": raw_key, "body": body})))
+    assert isinstance(counted["input_tokens"], int)
+    assert counted["input_tokens"] > 0
+    assert counted["x-experiential-ignored-parameters"] == [
+        "input_tokens->estimated(gateway_tokenizer)"
+    ]
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 0
+
+    with pytest.raises(NativeBridgeError) as ungranted:
+        control.count_tokens(
+            json.dumps(
+                {
+                    "raw_key": raw_key,
+                    "body": json.dumps(
+                        {"model": "not-granted", "messages": [{"role": "user", "content": "x"}]}
+                    ),
+                }
+            )
+        )
+    assert json.loads(ungranted.value.public_error_json)["status_code"] == 404
+
+    with pytest.raises(NativeBridgeError) as malformed:
+        control.count_tokens(
+            json.dumps({"raw_key": raw_key, "body": json.dumps({"model": "coding"})})
+        )
+    assert json.loads(malformed.value.public_error_json)["status_code"] == 400
+
+
+def _scheduled_pool_control_plane(
+    root: Path, *, throttle_cache_threshold: float | None = None
+) -> tuple[NativeControlPlane, str]:
+    """Load the control plane over a pool authoring a throttle backoff-and-redial schedule.
+
+    Seeds the standard certified two-deployment pool, then authors the
+    schedule the way the hosted platform does: as catalog data on the pool
+    record behind a fresh alias revision. Without a cache-stakes threshold
+    every rung is worth waiting for; with one, the per-rung budget reads the
+    cache at stake.
+
+    Args:
+        root: The gateway root to seed.
+        throttle_cache_threshold: The pool's cache-stakes threshold, or
+            ``None`` to author none.
+    """
+    from exp.common.models.catalog import load_model_catalog, write_model_catalog
+    from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
+    from exp.runtime.gateway.catalog_authority import snapshot_current_catalog
+
+    manager, raw_key = _configured_pool_gateway(root)
+    catalog_path = root / "models.toml"
+    catalog = load_model_catalog(catalog_path)
+    pool = catalog.gateway_pools["coding"].model_copy(
+        update={
+            "failover_mode": "maximize_cache",
+            "throttle_cache_threshold": throttle_cache_threshold,
+            "throttle_redial": GatewayThrottleRedialPolicy(
+                max_attempts=3, base_delay_ms=500, max_delay_ms=8_000
+            ),
+        }
+    )
+    write_model_catalog(
+        catalog_path, catalog.model_copy(update={"gateway_pools": {"coding": pool}})
+    )
+    _catalog, normalized, snapshot = snapshot_current_catalog(root)
+    manager.activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-pool-scheduled",
+        pool_id="coding",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    return NativeControlPlane(components), raw_key
+
+
+def test_admission_carries_the_throttle_redial_schedule_and_per_rung_eligibility(
+    tmp_path: Path,
+) -> None:
+    """The frozen retry facts grow the schedule only when authored; rungs say how long they wait.
+
+    An unauthored pool's admission has no ``throttle_redial`` key at all and
+    every wire entry carries a zero redial budget, so the data plane's throttle handling is
+    byte-identical to before. A pool authoring the schedule (and no
+    threshold) hands the data plane the exact schedule and gives every rung the
+    schedule's full redial budget. With a threshold and no settled cache
+    sample on this worker, the first rung fails over cold at once (nothing
+    known to be at stake, a colder rung follows) while the last rung, with no
+    cold alternative after it, still carries the full budget: the throttle
+    surfaces only once the gateway truly cannot serve.
+    """
+    control, raw_key = _pool_control_plane(tmp_path / "plain")
+    plain = _admit(control, raw_key, _chat_body())
+    assert "throttle_redial" not in plain
+    route = plain["route"]
+    assert isinstance(route, list)
+    assert [wire["throttle_redial_budget"] for wire in route] == [0, 0]
+
+    control, raw_key = _scheduled_pool_control_plane(tmp_path / "scheduled")
+    scheduled = _admit(control, raw_key, _chat_body())
+    assert scheduled["throttle_redial"] == {
+        "max_attempts": 3,
+        "base_delay_ms": 500,
+        "max_delay_ms": 8_000,
+    }
+    assert scheduled["maximum_same_deployment_attempts"] == 2
+    route = scheduled["route"]
+    assert isinstance(route, list)
+    assert [wire["throttle_redial_budget"] for wire in route] == [3, 3]
+
+    control, raw_key = _scheduled_pool_control_plane(
+        tmp_path / "gated", throttle_cache_threshold=0.5
+    )
+    gated = _admit(control, raw_key, _chat_body())
+    route = gated["route"]
+    assert isinstance(route, list)
+    assert [wire["throttle_redial_budget"] for wire in route] == [0, 3]
+
+
+def test_leading_only_rung_folds_mid_conversation_system_turns_on_chat_and_messages(
+    tmp_path: Path,
+) -> None:
+    """A vLLM rung serving the Qwen3.6+ template gets exactly one, leading, system turn.
+
+    The official template raises ``System message must be at the beginning.``
+    for any other placement; Claude Code injects a system turn after the first
+    user turn and after every tool_result. On a rung declaring
+    ``system_messages_leading_only`` the wire payload carries those as user
+    text, disclosed in ``ignored_parameters``, on the Chat surface (system at
+    index 3) and on the Messages surface (an in-list system turn after the
+    tool_result) alike.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://gateway.xplabs.ai/qwen/v1",
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000, supports_tools=True, system_messages_leading_only=True
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
+    )
+    chat = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "system", "content": "You are Claude Code."},
+                    {"role": "user", "content": "Diagnose the regression."},
+                    {"role": "assistant", "content": "Reading the failing test first."},
+                    {"role": "system", "content": "# Environment\nPlatform: linux"},
+                    {"role": "user", "content": "Go ahead."},
+                ],
+            }
+        ),
+    )
+    chat_messages = _payload_messages(chat)
+    assert [message["role"] for message in chat_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "user",
+    ]
+    assert chat_messages[3]["content"] == "# Environment\nPlatform: linux"
+    assert SYSTEM_FOLD_DISCLOSURE in cast(list[str], chat["ignored_parameters"])
+
+    messages = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "max_tokens": 64,
+                "system": "You are Claude Code.",
+                "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+                "messages": [
+                    {"role": "user", "content": "Diagnose the regression."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01", "name": "Read", "input": {}}
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_01", "content": "ok"}
+                        ],
+                    },
+                    {"role": "system", "content": "<total_tokens>1</total_tokens>"},
+                ],
+            }
+        ),
+        surface="messages",
+    )
+    messages_payload = _payload_messages(messages)
+    assert [message["role"] for message in messages_payload] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert messages_payload[4]["content"] == "<total_tokens>1</total_tokens>"
+    assert SYSTEM_FOLD_DISCLOSURE in cast(list[str], messages["ignored_parameters"])
+
+
+def test_gemini_rung_folds_a_mid_conversation_system_turn_instead_of_refusing(
+    tmp_path: Path,
+) -> None:
+    """Claude Code's Chat-wire shape against a Gemini alias is served, not refused.
+
+    A system turn after conversation start used to fail the whole route at
+    shaping ("A system message after conversation start is not supported by
+    this model route"; 1,747 requests in the seven days to 2026-09-15). On the
+    hoisting wire the leading run still rides systemInstruction, the later
+    instruction rides as user text at its position, and admission discloses
+    the fold.
+    """
+    from exp.common.models import GatewayTokenPrices
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="GEMINI_TEST_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="gem",
+        connection_name="gemini-main",
+        provider_model="gemini-2.5-pro",
+        exact_model_id="gemini-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(maximum_output_tokens=128_000),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="gem",
+        alias_name="gem",
+        revision_id="revision-gem",
+        pool_id="gem",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="gem")
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={
+                "TEST_PROVIDER_KEY": "provider-secret-canary",
+                "GEMINI_TEST_KEY": "gemini-secret-canary",
+            },
+        )
+    )
+    admission = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "gem",
+                "messages": [
+                    {"role": "system", "content": "You are Claude Code."},
+                    {"role": "user", "content": "Diagnose the regression."},
+                    {"role": "system", "content": "# Environment\nPlatform: linux"},
+                    {"role": "assistant", "content": "Reading the failing test first."},
+                    {"role": "user", "content": "Go ahead."},
+                ],
+            }
+        ),
+    )
+    route = admission["route"]
+    assert isinstance(route, list)
+    wire = route[0]
+    assert isinstance(wire, dict)
+    assert wire["dialect"] == "gemini_generate_content"
+    payload = wire["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["systemInstruction"] == {"parts": [{"text": "You are Claude Code."}]}
+    assert payload["contents"] == [
+        {
+            "role": "user",
+            "parts": [{"text": "Diagnose the regression.\n\n# Environment\nPlatform: linux"}],
+        },
+        {"role": "model", "parts": [{"text": "Reading the failing test first."}]},
+        {"role": "user", "parts": [{"text": "Go ahead."}]},
+    ]
+    assert HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE in cast(list[str], admission["ignored_parameters"])

@@ -60,6 +60,8 @@ class DiscoveredModel(ContractModel):
     supports_top_p: bool | None = None
     supports_top_k: bool | None = None
     supports_logprobs: bool | None = None
+    supports_frequency_penalty: bool | None = None
+    supports_presence_penalty: bool | None = None
     supports_reasoning: bool | None = None
     reasoning_effort: ReasoningEffort | None = None
     sampling_requires_reasoning_none: bool | None = None
@@ -177,10 +179,17 @@ def resolve_discovered_model(discovered: DiscoveredModel) -> ResolvedDiscoveredM
         discovered.supports_top_k,
         known.supports_top_k if known else None,
     )
-    supports_reasoning = _proven(
-        discovered.supports_reasoning,
-        known.supports_reasoning_effort if known else None,
-    )
+    # An explicit known.supports_reasoning wins (a budgeted-enabled model
+    # reasons without an effort ladder); absent it, the historical derivation
+    # from supports_reasoning_effort is preserved for backward compatibility.
+    known_reasoning: bool | None = None
+    if known is not None:
+        known_reasoning = (
+            known.supports_reasoning
+            if known.supports_reasoning is not None
+            else known.supports_reasoning_effort
+        )
+    supports_reasoning = _proven(discovered.supports_reasoning, known_reasoning)
     capabilities = ModelCapabilities(
         supports_tools=_proven(
             discovered.supports_tools,
@@ -204,6 +213,14 @@ def resolve_discovered_model(discovered: DiscoveredModel) -> ResolvedDiscoveredM
         supports_logprobs=_proven(
             discovered.supports_logprobs,
             known.supports_logprobs if known else None,
+        ),
+        supports_frequency_penalty=_proven(
+            discovered.supports_frequency_penalty,
+            known.supports_frequency_penalty if known else None,
+        ),
+        supports_presence_penalty=_proven(
+            discovered.supports_presence_penalty,
+            known.supports_presence_penalty if known else None,
         ),
         supports_reasoning=supports_reasoning,
         reasoning_effort=(

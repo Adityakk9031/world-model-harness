@@ -13,8 +13,26 @@ from typing import Literal
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
+from exp.runtime.models.providers.audios import gemini_audio_part
 from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
+from exp.runtime.models.providers.documents import gemini_document_part
+from exp.runtime.models.providers.images import gemini_image_part
+from exp.runtime.models.providers.instruction_turns import (
+    fold_instruction_turns_after_the_leading_run,
+)
 from exp.runtime.models.providers.reasoning_compat import gemini_thinking_level
+from exp.runtime.models.providers.videos import gemini_video_part
+
+GEMINI_THOUGHT_SIGNATURE_BYPASS = "skip_thought_signature_validator"
+"""Gemini's documented placeholder for a function call whose signature is gone.
+
+Gemini 3 answers a function call with an opaque ``thoughtSignature`` and
+rejects the next turn with HTTP 400 unless that part comes back carrying it.
+The gateway's public OpenAI and Anthropic surfaces have no field for it, so
+no client can round-trip the real value; Google documents this literal as the
+way to replay a function call whose signature was not retained.
+"""
 
 
 def gemini_model_path(model_id: str) -> str:
@@ -41,6 +59,8 @@ def gemini_generate_request(
     reasoning_effort: str | None = None,
     stop_sequences: tuple[str, ...] = (),
     response_json_schema: JsonObject | None = None,
+    json_object_output: bool = False,
+    default_maximum_output_tokens: int | None = DEFAULT_MAXIMUM_OUTPUT_TOKENS,
 ) -> JsonObject:
     """Convert a EXP request into Gemini's native generateContent payload.
 
@@ -57,6 +77,10 @@ def gemini_generate_request(
         reasoning_effort: Catalog-pinned reasoning effort used when the request omits one.
         stop_sequences: Exact stop strings admitted for the selected route.
         response_json_schema: Strict JSON schema admitted for structured output.
+        json_object_output: Whether to request schema-free JSON output
+            (``responseMimeType`` only, no ``responseJsonSchema``).
+        default_maximum_output_tokens: Model-client default when the request
+            omits a ceiling. Gateway callers pass ``None`` to preserve omission.
 
     Returns:
         A native payload for the generateContent and streamGenerateContent
@@ -68,13 +92,19 @@ def gemini_generate_request(
     system_parts: list[JsonObject] = []
     contents: list[JsonObject] = []
     tool_names: dict[str, str] = {}
-    for message in request.messages:
+    # systemInstruction has no position inside contents, so an instruction
+    # after conversation start rides as user text where the caller put it
+    # (consecutive user contents are accepted on this wire); only the leading
+    # run is hoisted.
+    for message in fold_instruction_turns_after_the_leading_run(request.messages):
         if message.role == "system":
             if message.content is None:
                 raise ValueError("system messages need text content")
             system_parts.append({"text": message.content})
             continue
         contents.append(_gemini_content(message, tool_names))
+    if json_object_output:
+        system_parts.append({"text": JSON_OBJECT_SYSTEM_INSTRUCTION})
     payload: JsonObject = {"contents": contents}
     if system_parts:
         payload["systemInstruction"] = {"parts": system_parts}
@@ -105,6 +135,8 @@ def gemini_generate_request(
     if response_json_schema is not None:
         generation["responseMimeType"] = "application/json"
         generation["responseJsonSchema"] = response_json_schema
+    elif json_object_output:
+        generation["responseMimeType"] = "application/json"
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning and effective_reasoning_effort is not None:
         generation["thinkingConfig"] = {
@@ -116,8 +148,8 @@ def gemini_generate_request(
     del supports_logprobs
     if request.maximum_output_tokens is not None:
         generation["maxOutputTokens"] = request.maximum_output_tokens
-    else:
-        generation["maxOutputTokens"] = DEFAULT_MAXIMUM_OUTPUT_TOKENS
+    elif default_maximum_output_tokens is not None:
+        generation["maxOutputTokens"] = default_maximum_output_tokens
     payload["generationConfig"] = generation
     return payload
 
@@ -151,6 +183,22 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
             ],
         }
     if message.role == "user":
+        if message.content_parts:
+            return {
+                "role": "user",
+                "parts": [
+                    {"text": part.text}
+                    if part.kind == "text"
+                    else gemini_image_part(part)
+                    if part.kind == "image"
+                    else gemini_video_part(part)
+                    if part.kind == "video"
+                    else gemini_audio_part(part)
+                    if part.kind == "audio"
+                    else gemini_document_part(part)
+                    for part in message.content_parts
+                ],
+            }
         if message.content is None:
             raise ValueError("user messages need text content")
         return {"role": "user", "parts": [{"text": message.content}]}
@@ -164,7 +212,12 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
     if action is not None:
         for call in action.tool_calls:
             tool_names[call.call_id] = call.name
-            parts.append({"functionCall": {"name": call.name, "args": call.arguments}})
+            parts.append(
+                {
+                    "functionCall": {"name": call.name, "args": call.arguments},
+                    "thoughtSignature": GEMINI_THOUGHT_SIGNATURE_BYPASS,
+                }
+            )
     if not parts:
         raise ValueError("assistant messages need text or tool calls")
     return {"role": "model", "parts": parts}

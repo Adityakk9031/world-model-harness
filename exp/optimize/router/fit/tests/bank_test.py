@@ -26,6 +26,7 @@ from exp.common.routing.bank import (
     CandidateEvidenceCount,
     KnnBankManifest,
     KnnEvidenceBank,
+    _novelty_floor,
     bank_bytes,
     build_knn_bank,
     evidence_counts,
@@ -315,8 +316,6 @@ def _world_protocol() -> EvaluationProtocol:
 
 def test_novelty_floor_ignores_duplicate_embeddings() -> None:
     """Duplicate tasks in the fit dataset do not collapse novelty floor to 1.0."""
-    from exp.common.routing.bank import _novelty_floor
-
     # 10 identical vectors of (1.0, 0.0) and 10 identical vectors of (0.0, 1.0)
     cluster_a = np.repeat([[1.0, 0.0]], 10, axis=0)
     cluster_b = np.repeat([[0.0, 1.0]], 10, axis=0)
@@ -329,8 +328,6 @@ def test_novelty_floor_ignores_duplicate_embeddings() -> None:
 
 def test_novelty_floor_unequal_duplicate_clusters_do_not_skew_percentile() -> None:
     """Large duplicate clusters do not dominate distinct neighbor percentiles."""
-    from exp.common.routing.bank import _novelty_floor
-
     # One huge cluster of 100 identical vectors and two distinct single vectors
     cluster_huge = np.repeat([[1.0, 0.0]], 100, axis=0)
     distinct_1 = np.asarray([[0.0, 1.0]])
@@ -350,7 +347,43 @@ def test_novelty_floor_unequal_duplicate_clusters_do_not_skew_percentile() -> No
 
 def test_novelty_floor_all_duplicate_bank_preserves_conservative_fallback() -> None:
     """An all-duplicate bank with no distinct-neighbor evidence falls back to 1.0."""
-    from exp.common.routing.bank import _novelty_floor
-
     cluster_all_same = np.repeat([[0.6, 0.8]], 50, axis=0).astype(np.float32)
     assert _novelty_floor(cluster_all_same) == 1.0
+
+
+@pytest.mark.parametrize("count", [0, 1])
+def test_novelty_floor_without_neighbor_evidence_is_conservative(count: int) -> None:
+    """Zero or one fit row cannot establish a distinct-neighbor threshold."""
+    assert _novelty_floor(np.ones((count, 2), dtype=np.float32)) == 1.0
+
+
+def test_novelty_floor_near_duplicates_do_not_merge_transitively() -> None:
+    """A suppressed middle vector cannot suppress a distinct later representative."""
+    angles = np.asarray([0.0, 0.003, 0.006])
+    embeddings = np.column_stack((np.cos(angles), np.sin(angles))).astype(np.float32)
+    expected = float(embeddings[0] @ embeddings[2])
+    assert expected < 1.0 - 1e-5
+    assert _novelty_floor(embeddings) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("above_threshold", [False, True])
+def test_novelty_floor_respects_the_duplicate_tolerance_boundary(above_threshold: bool) -> None:
+    """The adjacent float32 values around the tolerance remain on opposite sides."""
+    similarity = np.float32(1.0 - 1e-5)
+    if above_threshold:
+        similarity = np.nextafter(similarity, np.float32(1.0))
+    expected_duplicate = float(similarity) >= 1.0 - 1e-5
+    assert expected_duplicate is above_threshold
+    embeddings = np.asarray(
+        [[1.0, 0.0], [similarity, np.sqrt(1.0 - float(similarity) ** 2)]], dtype=np.float32
+    )
+    expected = 1.0 if above_threshold else float(similarity)
+    assert _novelty_floor(embeddings) == expected
+
+
+def test_novelty_floor_ignores_duplicates_as_neighbor_candidates() -> None:
+    """Suppressed rows affect neither the percentile weight nor neighbor selection."""
+    angles = np.asarray([0.0, 0.003, 0.6, 1.2])
+    embeddings = np.column_stack((np.cos(angles), np.sin(angles))).astype(np.float32)
+    representatives = embeddings[[0, 2, 3]]
+    assert _novelty_floor(embeddings) == _novelty_floor(representatives)

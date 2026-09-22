@@ -6,11 +6,13 @@ use serde_json::{json, Value};
 
 use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
 use crate::encode::compact_json;
+use crate::errors::PublicError;
 use crate::events::{
     CompletedToolCall, Event, ProviderAssistantMessagePhase, ProviderOutputItemKind,
     ProviderOutputItemStatus,
 };
 use crate::relay::event_retained_bytes;
+use crate::server::AppState;
 
 #[derive(Default)]
 struct RetainedMessage {
@@ -29,6 +31,12 @@ struct RetainedReasoning {
     done: bool,
 }
 
+/// One hosted tool output item retained as its verbatim compact JSON so a
+/// `previous_response_id` continuation can replay it byte-for-byte.
+struct RetainedHostedItem {
+    item: String,
+}
+
 /// Aggregated assistant output tracked while relaying one Responses stream.
 #[derive(Default)]
 pub(crate) struct ResponsesRetention {
@@ -40,6 +48,7 @@ pub(crate) struct ResponsesRetention {
     completed_tools: BTreeSet<u32>,
     tool_statuses: BTreeMap<u32, ProviderOutputItemStatus>,
     reasoning: BTreeMap<u32, RetainedReasoning>,
+    hosted: BTreeMap<u32, RetainedHostedItem>,
     pub(crate) carrier_events: Vec<Event>,
     retained_bytes: usize,
     pub(crate) overflowed: bool,
@@ -59,6 +68,7 @@ impl ResponsesRetention {
             self.messages.clear();
             self.tool_calls.clear();
             self.reasoning.clear();
+            self.hosted.clear();
             self.carrier_events.clear();
             return;
         }
@@ -180,7 +190,20 @@ impl ResponsesRetention {
                 reasoning.item_id = item_id.clone();
                 reasoning.encrypted_content = encrypted_content.clone();
             }
-            Event::Completed => self.finish_open_items(ProviderOutputItemStatus::Completed),
+            // The final verbatim item (the `done` shape when it arrived, else
+            // the last-seen one) is what a continuation replays.
+            Event::HostedToolItemStarted {
+                output_index, item, ..
+            }
+            | Event::HostedToolItemCompleted {
+                output_index, item, ..
+            } => {
+                self.hosted
+                    .insert(*output_index, RetainedHostedItem { item: item.clone() });
+            }
+            Event::Completed | Event::StoppedAtSequence(_) => {
+                self.finish_open_items(ProviderOutputItemStatus::Completed)
+            }
             Event::Incomplete | Event::Failed(_) => {
                 self.finish_open_items(ProviderOutputItemStatus::Incomplete);
             }
@@ -219,16 +242,6 @@ impl ResponsesRetention {
     pub(crate) fn refusal(&self) -> bool {
         self.refusal
     }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.text.is_empty()
-            && self.messages.is_empty()
-            && self.tool_calls.is_empty()
-            && self
-                .reasoning
-                .values()
-                .all(|reasoning| reasoning.encrypted_content.is_empty())
-    }
 }
 
 /// Build the retention payload consumed by the control plane's `remember`.
@@ -249,6 +262,10 @@ pub(crate) fn remember_argument(
         })).collect::<Vec<Value>>(),
         "refusal": retention.refusal,
         "reasoning_content_carrier": reasoning_content_carrier,
+        "hosted_items": retention.hosted.iter().map(|(output_index, hosted)| json!({
+            "output_index": output_index,
+            "item": serde_json::from_str::<Value>(&hosted.item).unwrap_or(Value::Null),
+        })).collect::<Vec<Value>>(),
         "encrypted_reasoning": retention.reasoning.iter()
             .filter(|(_, reasoning)| !reasoning.encrypted_content.is_empty())
             .map(|(output_index, reasoning)| json!({
@@ -266,6 +283,8 @@ pub(crate) fn remember_argument(
                 "item_id": call.provider_item_id,
                 "call_id": call.call_id,
                 "name": call.name,
+                "namespace": call.namespace,
+                "caller": call.caller,
                 "arguments": call.raw_arguments,
                 "status": call.provider_status.map(ProviderOutputItemStatus::as_str),
                 "custom": call.custom,
@@ -274,6 +293,32 @@ pub(crate) fn remember_argument(
     }))
 }
 
+/// Retain one finished Responses continuation before the terminal frames
+/// flush, mirroring the python service's ordering. Returns the public error
+/// when bounded retention fails closed.
+///
+/// An output-less turn (thinking spent the whole output budget, so the
+/// response is `incomplete` with no items) is retained too: the caller holds
+/// its response id, and `previous_response_id` naming it must resolve to the
+/// conversation so far rather than `previous_response_not_found`.
+pub(crate) async fn remember_continuation(
+    state: &AppState,
+    request_id: &str,
+    retention: &ResponsesRetention,
+    reasoning_content_carrier: Option<&str>,
+) -> Result<(), PublicError> {
+    if retention.overflowed || retention.refusal() {
+        return Ok(());
+    }
+    state
+        .bridge
+        .call(
+            "remember",
+            remember_argument(request_id, retention, reasoning_content_carrier),
+        )
+        .await
+        .map(|_| ())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +381,8 @@ mod tests {
             Event::ToolCallCompleted {
                 index: 2,
                 call: CompletedToolCall {
+                    namespace: None,
+                    caller: None,
                     call_id: "call-required".to_string(),
                     name: "lookup".to_string(),
                     provider_item_id: None,
@@ -382,6 +429,109 @@ mod tests {
     }
 
     #[test]
+    fn retention_carries_a_tool_call_namespace_to_the_remember_payload() {
+        let events = [
+            Event::ToolCallCompleted {
+                index: 0,
+                call: CompletedToolCall {
+                    namespace: Some("collaboration".to_string()),
+                    caller: None,
+                    call_id: "call-ns".to_string(),
+                    name: "spawn_agent".to_string(),
+                    provider_item_id: None,
+                    provider_status: None,
+                    raw_arguments: "{}".to_string(),
+                    custom: false,
+                },
+            },
+            Event::Completed,
+        ];
+        let mut retention = ResponsesRetention::default();
+        for event in &events {
+            retention.track(event);
+        }
+        let payload: Value =
+            serde_json::from_str(&remember_argument("request-ns", &retention, None))
+                .expect("retention payload is JSON");
+        assert_eq!(payload["tool_calls"][0]["namespace"], "collaboration");
+        assert_eq!(payload["tool_calls"][0]["name"], "spawn_agent");
+    }
+
+    #[test]
+    fn hosted_items_retain_their_final_verbatim_json_at_their_index() {
+        let events = [
+            Event::HostedToolItemStarted {
+                output_index: 0,
+                item_id: "ws_1".to_string(),
+                item_type: "web_search_call".to_string(),
+                item: "{\"id\":\"ws_1\",\"type\":\"web_search_call\",\"status\":\"in_progress\"}"
+                    .to_string(),
+            },
+            Event::HostedToolItemCompleted {
+                output_index: 0,
+                item_id: "ws_1".to_string(),
+                item_type: "web_search_call".to_string(),
+                item: "{\"id\":\"ws_1\",\"type\":\"web_search_call\",\"status\":\"completed\",\
+                       \"action\":{\"type\":\"search\",\"query\":\"pi\"}}"
+                    .to_string(),
+            },
+            Event::ProviderOutputItemStarted {
+                output_index: 1,
+                item_id: Some("msg_1".to_string()),
+                kind: ProviderOutputItemKind::Message,
+                status: None,
+                phase: None,
+            },
+            Event::ProviderTextDelta {
+                output_index: 1,
+                item_id: "msg_1".to_string(),
+                delta: "3.14159".to_string(),
+            },
+            Event::Completed,
+        ];
+        let mut retention = ResponsesRetention::default();
+        for event in &events {
+            retention.track(event);
+        }
+        let payload: Value =
+            serde_json::from_str(&remember_argument("request-ws", &retention, None))
+                .expect("retention payload is JSON");
+        assert_eq!(payload["hosted_items"][0]["output_index"], 0);
+        // The done-frame item (not the added one) is what a continuation replays.
+        assert_eq!(payload["hosted_items"][0]["item"]["action"]["query"], "pi");
+        assert_eq!(payload["message_outputs"][0]["item_id"], "msg_1");
+    }
+
+    #[test]
+    fn retention_carries_a_tool_call_caller_to_the_remember_payload() {
+        let events = [
+            Event::ToolCallCompleted {
+                index: 0,
+                call: CompletedToolCall {
+                    namespace: None,
+                    caller: Some(serde_json::json!({"type": "program", "id": "prog_1"})),
+                    call_id: "call-caller".to_string(),
+                    name: "lookup".to_string(),
+                    provider_item_id: None,
+                    provider_status: None,
+                    raw_arguments: "{}".to_string(),
+                    custom: false,
+                },
+            },
+            Event::Completed,
+        ];
+        let mut retention = ResponsesRetention::default();
+        for event in &events {
+            retention.track(event);
+        }
+        let payload: Value =
+            serde_json::from_str(&remember_argument("request-caller", &retention, None))
+                .expect("retention payload is JSON");
+        assert_eq!(payload["tool_calls"][0]["caller"]["id"], "prog_1");
+        assert_eq!(payload["tool_calls"][0]["caller"]["type"], "program");
+    }
+
+    #[test]
     fn empty_provider_message_still_retains_lifecycle_identity() {
         let events = [
             Event::ProviderOutputItemStarted {
@@ -405,7 +555,6 @@ mod tests {
             retention.track(event);
         }
 
-        assert!(!retention.is_empty());
         let payload: Value =
             serde_json::from_str(&remember_argument("request-1", &retention, None))
                 .expect("retention payload is JSON");

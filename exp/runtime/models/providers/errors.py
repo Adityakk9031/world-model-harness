@@ -55,14 +55,17 @@ class ProviderRefusalError(ProviderResponseError):
 class ProviderCapabilityError(ValueError):
     """A request requires gateway behavior the deployment cannot preserve."""
 
-    def __init__(self, *, capability: str) -> None:
+    def __init__(self, *, capability: str, detail: str | None = None) -> None:
         """Name the unsupported public capability without provider content.
 
         Args:
             capability: Stable capability field rejected before dispatch.
+            detail: Optional caller-safe sentence completing the public
+                message, such as which provider a media handle names.
         """
         super().__init__(f"provider deployment does not support {capability}")
         self.capability = capability
+        self.detail = detail
 
 
 class ProviderParameterError(ValueError):
@@ -92,15 +95,20 @@ class UnsupportedReasoningEffortError(ProviderParameterError):
             supported_efforts: Ordered effort values accepted by every route deployment.
             param: Public request path carrying the unsupported value.
         """
+        # "effort parameter" + "not supported" is deliberate phrasing: Claude
+        # Code's built-in recovery latch drops output_config.effort and
+        # retries only when the 400 message matches that predicate; any other
+        # wording turns a gracefully degradable condition into a wedged
+        # session (issue #795).
         if supported_efforts:
             choices = ", ".join(repr(value) for value in supported_efforts)
             message = (
-                f"Reasoning effort {effort!r} is not supported by this model route. "
-                f"Supported values: {choices}."
+                f"The effort parameter value {effort!r} is not supported by this model "
+                f"route. Supported values: {choices}."
             )
         else:
             message = (
-                f"The parameter {param!r} is not supported by this model route. "
+                f"The effort parameter ({param!r}) is not supported by this model route. "
                 "Remove the field or choose a different model."
             )
         super().__init__(message=message, param=param, code="unsupported_parameter")
@@ -215,6 +223,20 @@ def _transport_failure(status_code: int | None) -> GatewayFailure:
             failure_class=GatewayFailureClass.THROTTLED,
             safe_message=(
                 "provider throttled the request; retry after the delay in the Retry-After header"
+            ),
+            failover_eligible=True,
+            safe_details=details,
+        )
+    if status_code == 402:
+        # The provider ACCOUNT's billing state (trial quota exhausted, postpaid
+        # billing disabled), never the caller's request fields: operator-
+        # actionable deadness that fails over in every failover mode instead of
+        # surfacing a corrective 400 to the caller.
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_QUOTA,
+            safe_message=(
+                "provider account quota or billing is exhausted; ask the gateway "
+                "operator to fund or enable the provider account"
             ),
             failover_eligible=True,
             safe_details=details,

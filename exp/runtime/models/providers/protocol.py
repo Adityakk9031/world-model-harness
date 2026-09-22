@@ -18,6 +18,7 @@ from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
 )
+from exp.runtime.models.providers.media_handles import preflight_media_handles
 
 
 class AsyncCompletedModelClient(Protocol):
@@ -181,12 +182,63 @@ class GatewayDispatchSigner(Protocol):
         ...
 
 
+# Wire dialects whose provider has no stop field but whose streams the native
+# data plane cuts itself: the OpenAI Responses API. A rung on one of these
+# dialects satisfies ``stop_sequences`` regardless of its catalog flag, because
+# the gateway, not the provider, honours the caller's sequences.
+STOP_SEQUENCE_EMULATED_DIALECTS: frozenset[str] = frozenset({"openai_responses"})
+
+
+def emulated_gateway_capabilities(
+    dialect: str, *, emulate_parallel_tool_calls: bool = False
+) -> frozenset[str]:
+    """Name the capabilities the data plane emulates for one wire dialect.
+
+    Args:
+        dialect: The rung's wire dialect (``GatewayWireProfile.dialect``).
+        emulate_parallel_tool_calls: Admit ``parallel_tool_calls`` on a rung
+            whose wire lacks the control (``true`` dropped as the provider's
+            default, ``false`` serialized by the data plane, both disclosed).
+            Admission turns this on only as the LAST resort, after no rung
+            honouring the control natively could serve, so a native rung is
+            always preferred over emulation.
+
+    Returns:
+        Capability labels admission treats as satisfied without a catalog
+        declaration; empty for dialects with nothing emulated.
+    """
+    emulated: set[str] = set()
+    if dialect in STOP_SEQUENCE_EMULATED_DIALECTS:
+        emulated.add("stop_sequences")
+    if emulate_parallel_tool_calls:
+        emulated.add("parallel_tool_calls")
+    return frozenset(emulated)
+
+
+def emulated_stop_sequences(dialect: str, request: GatewayRequest) -> tuple[str, ...]:
+    """Return the stop sequences the data plane must enforce for one rung.
+
+    Args:
+        dialect: The rung's wire dialect.
+        request: Canonical request whose ``stop`` the provider wire cannot carry.
+
+    Returns:
+        The caller's exact sequences when this dialect emulates them; empty
+        when the provider honours ``stop`` natively (or none were requested).
+    """
+    if request.stop and dialect in STOP_SEQUENCE_EMULATED_DIALECTS:
+        return tuple(request.stop)
+    return ()
+
+
 def preflight_gateway_request(
     request: GatewayRequest,
     capabilities: GatewayDeploymentCapabilities,
     *,
     model_capabilities: ModelCapabilities | None = None,
     public_stream: bool | None = None,
+    route_provider: str | None = None,
+    emulated_capabilities: frozenset[str] = frozenset(),
 ) -> None:
     """Reject gateway semantics a deployment cannot preserve before provider dispatch.
 
@@ -199,6 +251,13 @@ def preflight_gateway_request(
         public_stream: Whether the caller requested streaming. ``None`` uses
             ``request.stream`` for standalone callers. Hosted execution passes
             this explicitly because its provider request is always streamed.
+        route_provider: The deployment's catalog provider. A provider media
+            handle is admissible only when this equals the handle's provider;
+            ``None`` (standalone callers) admits no handle.
+        emulated_capabilities: Capability labels the data plane provides for
+            this rung itself (see ``emulated_gateway_capabilities``); a
+            requirement in this set passes even when the catalog declares it
+            unsupported.
 
     Raises:
         ProviderCapabilityError: A present request feature is unsupported.
@@ -206,7 +265,15 @@ def preflight_gateway_request(
     requirements: tuple[tuple[bool, bool, str], ...] = ()
     if model_capabilities is not None:
         requirements += (
-            (bool(request.tools), model_capabilities.supports_tools is not False, "function_tools"),
+            (
+                # Verbatim native declarations are tools too: a rung that
+                # declares no tool support must reject a native-tools-only
+                # request locally instead of dispatching a known-unsupported
+                # provider call.
+                bool(request.tools) or bool(request.provider_native_tools),
+                model_capabilities.supports_tools is not False,
+                "function_tools",
+            ),
             (
                 request.structured_text is not None,
                 model_capabilities.supports_structured_output,
@@ -224,6 +291,25 @@ def preflight_gateway_request(
             ),
             capabilities.supports_developer_messages,
             "developer_messages",
+        ),
+        (bool(request.images), capabilities.supports_image_input, "image_input"),
+        (
+            any(image.url is not None for image in request.images),
+            capabilities.supports_image_url_input,
+            "image_url_input",
+        ),
+        (bool(request.videos), capabilities.supports_video_input, "video_input"),
+        (
+            any(video.url is not None for video in request.videos),
+            capabilities.supports_video_url_input,
+            "video_url_input",
+        ),
+        (bool(request.audios), capabilities.supports_audio_input, "audio_input"),
+        (bool(request.documents), capabilities.supports_pdf_input, "pdf_input"),
+        (
+            any(document.url is not None for document in request.documents),
+            capabilities.supports_pdf_url_input,
+            "pdf_url_input",
         ),
         (bool(request.stop), capabilities.supports_stop_sequences, "stop_sequences"),
         (
@@ -250,8 +336,13 @@ def preflight_gateway_request(
     if request.stream and not caller_stream:
         requirements += ((True, capabilities.supports_streaming, "streaming"),)
     for requested, supported, capability in requirements:
-        if requested and not supported:
+        if requested and not supported and capability not in emulated_capabilities:
             raise ProviderCapabilityError(capability=capability)
+    preflight_media_handles(
+        request.media_handles,
+        supports_media_handle_input=capabilities.supports_media_handle_input,
+        route_provider=route_provider,
+    )
     stop_limit = capabilities.maximum_stop_sequences
     if stop_limit is not None and len(request.stop) > stop_limit:
         raise ProviderParameterError(

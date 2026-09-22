@@ -225,10 +225,6 @@ def test_project_option_launches_the_native_gateway_on_loopback(
     monkeypatch.setattr("exp.runtime.gateway.lifecycle.load_gateway_components", load_components)
     monkeypatch.setattr("exp.runtime.gateway.lifecycle.gateway_instance_lock", instance_lock)
     monkeypatch.setattr(
-        "exp.runtime.gateway.native_execution.native_serving_blockers",
-        lambda _components: (),
-    )
-    monkeypatch.setattr(
         "exp.runtime.gateway.guardrails.config.load_guardrail_engine",
         lambda _root: None,
     )
@@ -311,10 +307,6 @@ def test_unbindable_port_fails_before_any_ready_receipt(
         lambda _root, **_kwargs: components,
     )
     monkeypatch.setattr(
-        "exp.runtime.gateway.native_execution.native_serving_blockers",
-        lambda _components: (),
-    )
-    monkeypatch.setattr(
         "exp.runtime.gateway.guardrails.config.load_guardrail_engine",
         lambda _root: None,
     )
@@ -324,6 +316,7 @@ def test_unbindable_port_fails_before_any_ready_receipt(
             reconciled_expired_requests=0,
             reconciled_unknown_attempts=0,
             request_timeout_seconds=120.0,
+            guardrail_detectors={},
         ),
     )
 

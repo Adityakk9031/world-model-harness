@@ -2,18 +2,33 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.anthropic_protocol.requests import decode_messages
+from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST
+from exp.runtime.anthropic_protocol.requests import decode_messages, decode_messages_count_tokens
 from exp.runtime.gateway.contracts import (
+    ExposedReasoningContentBlock,
     GatewayApiSurface,
     GatewayNamedToolChoice,
     RedactedThinkingBlock,
+    SealedReasoningContentBlock,
     ThinkingBlock,
 )
+from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
+from exp.runtime.models.providers.wire_messages import anthropic_blocks
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+
+_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+    "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
+"""One valid single-pixel PNG, base64 encoded."""
 
 
 def _body(**overrides: JsonValue) -> JsonObject:
@@ -152,15 +167,83 @@ def test_output_config_is_carried_verbatim_and_maps_canonical_effort() -> None:
 def test_thinking_config_is_carried_verbatim() -> None:
     """The caller's thinking object survives byte-for-byte on the canonical request."""
     config: JsonObject = {"type": "enabled", "budget_tokens": 1024}
-    decoded = decode_messages(_body(thinking=config))
+    decoded = decode_messages(_body(max_tokens=4096, thinking=config))
     assert decoded.request.provider_thinking_config == config
     assert decode_messages(_body()).request.provider_thinking_config is None
 
-    with pytest.raises(OpenAIProtocolError) as excinfo:
-        decode_messages(_body(thinking={"type": "enabled"}))
-    assert excinfo.value.detail.param == "thinking"
+    # Claude Code sends a bare enabled config (no budget); the decoder keeps it
+    # verbatim and route shaping derives or translates the depth per rung.
+    bare: JsonObject = {"type": "enabled"}
+    assert decode_messages(_body(thinking=bare)).request.provider_thinking_config == bare
     with pytest.raises(OpenAIProtocolError):
         decode_messages(_body(thinking={"type": "adaptive", "budget_tokens": 64}))
+
+
+def test_interleaved_thinking_turn_keeps_its_block_order_for_replay() -> None:
+    """A thinking turn carries its blocks in the caller's order alongside the
+    flattened fields, so the Anthropic wire can replay it byte-for-byte:
+    interleaved thinking puts thinking between tool_use blocks, and the
+    provider refuses a reordered latest assistant message."""
+    blocks: list[JsonObject] = [
+        {"type": "thinking", "thinking": "plan", "signature": "sig-a"},
+        {"type": "tool_use", "id": "call-1", "name": "read", "input": {"path": "a"}},
+        {"type": "thinking", "thinking": "next", "signature": "sig-b"},
+        {"type": "text", "text": "reading"},
+        {"type": "tool_use", "id": "call-2", "name": "read", "input": {"path": "b"}},
+    ]
+    decoded = decode_messages(
+        _body(
+            messages=[{"role": "user", "content": "go"}, {"role": "assistant", "content": blocks}]
+        )
+    )
+    assistant = decoded.request.messages[1]
+    assert assistant.provider_anthropic_blocks == tuple(blocks)
+    assert [block.kind for block in assistant.provider_reasoning] == ["thinking", "thinking"]
+    assert [call.call_id for call in assistant.tool_calls] == ["call-1", "call-2"]
+    role, wire = anthropic_blocks(assistant)
+    assert role == "assistant"
+    assert wire == blocks
+
+    # An empty text block carrying Claude Code's cache marker drops (the wire
+    # rejects it) and its breakpoint lands on the closest prior block that can
+    # carry one, skipping the signed thinking block.
+    marked = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        *blocks[:3],
+                        {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+                        *blocks[3:],
+                    ],
+                },
+            ]
+        )
+    )
+    _role, migrated = anthropic_blocks(marked.request.messages[1])
+    assert len(migrated) == len(blocks)
+    assert migrated[1] == {**blocks[1], "cache_control": {"type": "ephemeral"}}
+    assert migrated[2] == blocks[2]
+    assert [block["type"] for block in migrated] == [block["type"] for block in blocks]
+
+    # A turn without thinking has no signatures to protect and stays flattened.
+    plain = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}, blocks[1]]},
+            ]
+        )
+    )
+    assert plain.request.messages[1].provider_anthropic_blocks is None
+
+    # Reasoning narrowed away (nothing left to verify) falls back to the
+    # flattened emission rather than replaying thinking the rung dropped.
+    stripped = assistant.model_copy(update={"provider_reasoning": ()})
+    _role, fallback = anthropic_blocks(stripped)
+    assert [block["type"] for block in fallback] == ["text", "tool_use", "tool_use"]
 
 
 def test_thinking_history_blocks_ride_the_opaque_carrier_in_order() -> None:
@@ -199,13 +282,18 @@ def test_thinking_history_blocks_ride_the_opaque_carrier_in_order() -> None:
     assert redacted.data == "opaque=="
 
     # A thinking-only assistant turn (cut off mid-thinking) is legal history.
+    # Anthropic signs the block even when max_tokens cuts it short; an
+    # UNSIGNED block is the gateway's own exposed reasoning (see
+    # test_unsigned_thinking_block_decodes_as_gateway_plaintext_reasoning).
     only = decode_messages(
         _body(
             messages=[
                 {"role": "user", "content": "go"},
                 {
                     "role": "assistant",
-                    "content": [{"type": "thinking", "thinking": "partial"}],
+                    "content": [
+                        {"type": "thinking", "thinking": "partial", "signature": "sig-cut"}
+                    ],
                 },
                 {"role": "user", "content": "continue"},
             ]
@@ -259,8 +347,218 @@ def test_missing_max_tokens_is_rejected_with_its_field() -> None:
     assert excinfo.value.detail.param == "max_tokens"
 
 
-def test_image_blocks_are_rejected_with_a_targeted_hint() -> None:
-    """A known-but-unsupported block gets its own explanation."""
+def test_count_tokens_body_needs_no_max_tokens() -> None:
+    """Anthropic's count request carries only prompt-side fields.
+
+    The count decoder is the Messages decoder with the generation budget
+    optional: a body of ``model`` + ``messages`` (plus system and tools)
+    decodes to a canonical request with no output ceiling, a body that does
+    carry ``max_tokens`` keeps it, and everything else is validated exactly
+    as the generation endpoint validates it.
+    """
+    payload = _body(
+        system="be terse",
+        tools=[{"name": "search", "description": "look up", "input_schema": {"type": "object"}}],
+    )
+    del payload["max_tokens"]
+    decoded = decode_messages_count_tokens(payload)
+    assert decoded.alias == "coding"
+    assert decoded.request.maximum_output_tokens is None
+    assert decoded.request.maximum_output_tokens_parameter is None
+    assert len(decoded.request.tools) == 1
+
+    budgeted = decode_messages_count_tokens(_body())
+    assert budgeted.request.maximum_output_tokens == 128
+
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages_count_tokens({"model": "coding"})
+    assert excinfo.value.detail.param == "messages"
+
+
+def test_image_blocks_are_retained_in_caller_order() -> None:
+    """An image block rides the canonical parts beside its text."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _PNG_BASE64,
+                            },
+                        },
+                    ],
+                }
+            ]
+        )
+    )
+    message = decoded.request.messages[-1]
+    assert message.content == "what is this"
+    assert [part.kind for part in message.content_parts] == ["text", "image"]
+    assert message.images[0].data == _PNG_BASE64
+
+
+def test_a_cache_marker_on_an_image_block_is_retained() -> None:
+    """A breakpoint the caller placed on the image reaches the wire."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _PNG_BASE64,
+                            },
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    assert decoded.request.messages[-1].images[0].cache_control == {"type": "ephemeral"}
+
+
+def test_an_empty_text_block_beside_an_image_never_re_emits() -> None:
+    """An attachment's empty text block never reaches the Anthropic wire."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ""},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _PNG_BASE64,
+                            },
+                        },
+                        {"type": "text", "text": "read it", "cache_control": {"type": "ephemeral"}},
+                    ],
+                }
+            ]
+        )
+    )
+    message = decoded.request.messages[-1]
+    assert [part.kind for part in message.content_parts] == ["image", "text"]
+    _role, blocks = anthropic_blocks(message)
+    assert blocks == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64},
+        },
+        {"type": "text", "text": "read it", "cache_control": {"type": "ephemeral"}},
+    ]
+
+
+def test_a_tool_result_image_re_emits_as_the_exact_block_run() -> None:
+    """An Anthropic rung round-trips the tool screenshot losslessly."""
+    decoded = decode_messages(
+        _body(messages=_tool_result_image_messages(leading_text="tool said:"))
+    )
+    role, blocks = anthropic_blocks(decoded.request.messages[-1])
+    assert role == "user"
+    assert blocks == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-1",
+            "content": [
+                {"type": "text", "text": "tool said:"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": _PNG_BASE64,
+                    },
+                },
+            ],
+        }
+    ]
+
+
+def test_a_cache_marker_on_a_tool_result_text_block_round_trips() -> None:
+    """A breakpoint on an inner text block re-emits with the block run.
+
+    Claude Code marks the last block of recent user turns; in an agent loop
+    that block can be a text sub-block inside an image-bearing tool_result,
+    and losing it would silently un-cache the conversation prefix.
+    """
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "read the screenshot"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "call-1", "name": "computer", "input": {}}
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "tool said:",
+                                    "cache_control": {"type": "ephemeral"},
+                                },
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": _PNG_BASE64,
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                },
+            ]
+        )
+    )
+    _role, blocks = anthropic_blocks(decoded.request.messages[-1])
+    assert blocks == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-1",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "tool said:",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": _PNG_BASE64,
+                    },
+                },
+            ],
+        }
+    ]
+
+
+def test_malformed_image_source_is_rejected() -> None:
+    """An image the gateway cannot forward is rejected at its own path."""
     with pytest.raises(OpenAIProtocolError) as excinfo:
         decode_messages(
             _body(
@@ -272,7 +570,7 @@ def test_image_blocks_are_rejected_with_a_targeted_hint() -> None:
                 ]
             )
         )
-    assert "image blocks are not supported" in excinfo.value.detail.message
+    assert excinfo.value.detail.param == "messages.0.content.0.source"
 
 
 def test_document_block_inside_tool_result_is_rejected() -> None:
@@ -295,6 +593,305 @@ def test_document_block_inside_tool_result_is_rejected() -> None:
             )
         )
     assert "document blocks are not supported" in excinfo.value.detail.message
+
+
+def _tool_result_image_messages(*, leading_text: str | None = None) -> list[JsonObject]:
+    """The owner-reported repro: text turn, tool_use, tool_result with an image."""
+    inner: list[JsonObject] = []
+    if leading_text is not None:
+        inner.append({"type": "text", "text": leading_text})
+    inner.append(
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64},
+        }
+    )
+    return [
+        {"role": "user", "content": "read the screenshot"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "call-1", "name": "computer", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": inner}],
+        },
+    ]
+
+
+def test_image_blocks_inside_tool_results_ride_the_tool_message_parts() -> None:
+    """A tool screenshot decodes losslessly instead of 400ing the session.
+
+    Anthropic's real API accepts image sub-blocks in tool_result content, and
+    Claude Code's Read-on-image and computer-use tools emit them routinely;
+    the block is baked into history, so rejecting it wedges every later turn.
+    """
+    decoded = decode_messages(
+        _body(messages=_tool_result_image_messages(leading_text="tool said:"))
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.tool_call_id == "call-1"
+    assert tool_message.content == "tool said:"
+    assert [part.kind for part in tool_message.content_parts] == ["text", "image"]
+    assert tool_message.images[0].data == _PNG_BASE64
+
+
+def test_an_image_only_tool_result_decodes_with_empty_content() -> None:
+    """The exact wedged-session repro: content is one bare image block."""
+    decoded = decode_messages(_body(messages=_tool_result_image_messages()))
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.content == ""
+    assert [part.kind for part in tool_message.content_parts] == ["image"]
+
+
+def test_a_text_only_tool_result_retains_no_content_parts() -> None:
+    """Existing text-only results serialize and digest exactly as before."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [{"type": "text", "text": "plain"}],
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.content == "plain"
+    assert tool_message.content_parts == ()
+
+
+def test_an_unknown_tool_result_sub_block_names_its_index_and_type() -> None:
+    """A union miss must name the offending block, never the string arm.
+
+    The misleading "content.str: Input should be a valid string" rendering
+    sent an entire diagnosis chain toward the caller's request shape when the
+    real problem was one unsupported sub-block in the list arm.
+    """
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call-1",
+                                "content": [{"type": "mystery"}],
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+    assert excinfo.value.detail.param == "messages.0.content.0.content.0"
+    assert "unsupported block type 'mystery'" in excinfo.value.detail.message
+    assert ".str" not in (excinfo.value.detail.param or "")
+
+
+def test_a_union_miss_never_reports_the_string_arm() -> None:
+    """A structurally bad list block reports its own path, not content.str."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(messages=[{"role": "user", "content": [{"type": "text", "text": 7}]}])
+        )
+    param = excinfo.value.detail.param or ""
+    assert ".str" not in param
+    assert param.startswith("messages.0.content.0")
+
+
+_PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+"""One short PDF header, base64 encoded."""
+
+
+def _pdf_block(data: str = _PDF_BASE64, **extra: JsonValue) -> JsonObject:
+    """Build one base64 Anthropic PDF document block with optional extra fields."""
+    block: JsonObject = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": data},
+    }
+    block.update(extra)
+    return block
+
+
+def test_document_blocks_are_retained_in_caller_order_with_interleaved_text() -> None:
+    """PDF blocks ride the canonical parts at their positions among the text."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first: "},
+                        _pdf_block(title="one.pdf"),
+                        {"type": "text", "text": " second: "},
+                        _pdf_block("JVBERi0xLjcK"),
+                        {"type": "text", "text": " compare them"},
+                    ],
+                }
+            ]
+        )
+    )
+    message = decoded.request.messages[-1]
+    assert message.content == "first:  second:  compare them"
+    assert [part.kind for part in message.content_parts] == [
+        "text",
+        "document",
+        "text",
+        "document",
+        "text",
+    ]
+    documents = decoded.request.documents
+    assert [document.data for document in documents] == [_PDF_BASE64, "JVBERi0xLjcK"]
+    assert [document.name for document in documents] == ["one.pdf", None]
+    assert documents[0].media_type == "application/pdf"
+
+
+def test_a_document_url_source_and_cache_marker_are_retained() -> None:
+    """A remote document and a breakpoint placed on it both reach the canonical part."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {"type": "url", "url": "https://example.com/brief.pdf"},
+                            "cache_control": {"type": "ephemeral"},
+                            "citations": {"enabled": False},
+                        },
+                        {"type": "text", "text": "summarize"},
+                    ],
+                }
+            ]
+        )
+    )
+    document = decoded.request.documents[0]
+    assert document.url == "https://example.com/brief.pdf"
+    assert document.data is None
+    assert document.cache_control == {"type": "ephemeral"}
+
+
+def test_document_sent_once_survives_a_multi_turn_thread() -> None:
+    """A PDF in an earlier user turn is retained when later turns reference it."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [_pdf_block(), {"type": "text", "text": "what is the title"}],
+                },
+                {"role": "assistant", "content": "Minimal PDF."},
+                {"role": "user", "content": "and the page count?"},
+            ]
+        )
+    )
+    assert [len(message.documents) for message in decoded.request.messages] == [1, 0, 0]
+    assert decoded.request.messages[-1].content_parts == ()
+
+
+@pytest.mark.parametrize(
+    ("block", "param"),
+    [
+        (
+            {
+                "type": "document",
+                "source": {"type": "base64", "media_type": "text/plain", "data": "aGk="},
+            },
+            "messages.0.content.0.source",
+        ),
+        (
+            {
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": "!!"},
+            },
+            "messages.0.content.0.source",
+        ),
+        (
+            {"type": "document", "source": {"type": "url", "url": "ftp://example.com/a.pdf"}},
+            "messages.0.content.0.source",
+        ),
+        (_pdf_block(citations={"enabled": True}), "messages.0.content.0.citations"),
+    ],
+)
+def test_unservable_document_blocks_are_rejected_at_their_path(
+    block: JsonObject, param: str
+) -> None:
+    """A document the gateway cannot forward is rejected loudly, never dropped."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(_body(messages=[{"role": "user", "content": [block]}]))
+    assert excinfo.value.detail.param == param
+
+
+def test_files_api_document_sources_decode_to_anthropic_handles() -> None:
+    """A ``file`` source becomes an Anthropic-scoped handle, never bytes or a URL."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "document", "source": {"type": "file", "file_id": "file_011abc"}}
+                    ],
+                }
+            ]
+        )
+    )
+    (document,) = decoded.request.documents
+    assert document.handle is not None
+    assert document.handle.provider == "anthropic"
+    assert document.handle.reference == "file_011abc"
+    assert document.data is None and document.url is None
+
+
+def test_malformed_files_api_ids_are_rejected() -> None:
+    """A ``file`` source whose id is not an Anthropic Files id fails closed."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "document", "source": {"type": "file", "file_id": "file-1"}}
+                        ],
+                    }
+                ]
+            )
+        )
+
+
+def test_assistant_document_blocks_are_rejected() -> None:
+    """Only a caller message may carry a document."""
+    with pytest.raises(OpenAIProtocolError, match="only valid in user messages"):
+        decode_messages(_body(messages=[{"role": "assistant", "content": [_pdf_block()]}]))
+
+
+def test_too_many_documents_are_rejected() -> None:
+    """The per-request document ceiling fails closed with the ceiling named."""
+    with pytest.raises(OpenAIProtocolError, match="at most 5 documents"):
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [_pdf_block() for _ in range(MAXIMUM_DOCUMENTS_PER_REQUEST + 1)],
+                    }
+                ]
+            )
+        )
 
 
 def test_role_misplaced_blocks_and_empty_content_are_rejected() -> None:
@@ -706,3 +1303,965 @@ def test_validation_errors_state_the_expectation_not_only_the_field() -> None:
     assert invalid.value.detail.param == "tools.0.strict"
     assert "Invalid value for 'tools.0.strict'" in invalid.value.detail.message
     assert "bool" in invalid.value.detail.message
+
+
+def test_the_prod_failing_web_search_tool_shape_decodes() -> None:
+    """The exact Claude Code WebSearch entry decodes and carries verbatim.
+
+    Production incident (2026-08-31 class): the strict custom-tool model
+    400d every session with WebSearch enabled because the server tool entry
+    carries no input_schema.
+    """
+    server_entry: JsonObject = {
+        "type": "web_search_20250305",
+        "name": "web_search",
+        "max_uses": 8,
+    }
+    decoded = decode_messages(
+        _body(
+            tools=[
+                {"name": "Bash", "description": "run", "input_schema": {"type": "object"}},
+                server_entry,
+            ],
+            tool_choice={"type": "auto"},
+        )
+    )
+    request = decoded.request
+    assert tuple(tool.name for tool in request.tools) == ("Bash",)
+    # The carried entry equals the raw payload object byte-for-byte.
+    assert request.provider_server_tools == (server_entry,)
+
+
+def test_every_verified_web_search_version_decodes() -> None:
+    """All live-verified web_search versions pass the accept table."""
+    for tool_type in ("web_search_20250305", "web_search_20260209", "web_search_20260318"):
+        decoded = decode_messages(_body(tools=[{"type": tool_type, "name": "web_search"}]))
+        entries = decoded.request.provider_server_tools
+        assert len(entries) == 1 and entries[0]["type"] == tool_type
+
+
+def test_unserved_server_tool_types_are_rejected_by_name() -> None:
+    """A classified-but-unserved or unknown server tool type 400s loudly."""
+    for tool_type in ("web_fetch_20250910", "code_execution_20250522", "someday_20990101"):
+        with pytest.raises(OpenAIProtocolError) as error:
+            decode_messages(_body(tools=[{"type": tool_type, "name": "t"}]))
+        assert error.value.status_code == 400
+        assert tool_type in error.value.detail.message
+        assert "web_search_20250305" in error.value.detail.message
+
+
+def test_malformed_server_tool_entries_are_rejected() -> None:
+    """A non-pattern type or a nameless server entry stays a validation error."""
+    for entry in (
+        {"type": "Web Search!", "name": "web_search"},
+        {"type": "web_search_20250305"},
+    ):
+        with pytest.raises(OpenAIProtocolError) as error:
+            decode_messages(_body(tools=[entry]))
+        assert error.value.status_code == 400
+
+
+def _echoed_web_search_turn() -> list[JsonObject]:
+    """The assistant blocks a served WebSearch turn echoes back (live shape)."""
+    return [
+        {
+            "type": "server_tool_use",
+            "id": "srvtoolu_fixture",
+            "name": "web_search",
+            "input": {"query": "current stable Python"},
+        },
+        {
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_fixture",
+            "content": [
+                {
+                    "type": "web_search_result",
+                    "title": "Python versions",
+                    "url": "https://www.python.org/doc/versions/",
+                    "encrypted_content": "Et8QCioIExgC",
+                    "page_age": "March 12, 2026",
+                }
+            ],
+            "caller": {"type": "direct"},
+        },
+        {
+            "citations": [
+                {
+                    "type": "web_search_result_location",
+                    "cited_text": "Python 3.14.7, released on 5 August 2026",
+                    "url": "https://www.python.org/doc/versions/",
+                    "title": "Python versions",
+                    "encrypted_index": "Eo8BCioIExgC",
+                }
+            ],
+            "type": "text",
+            "text": "The current stable Python version is 3.14.7.",
+        },
+    ]
+
+
+def test_echoed_server_tool_turn_rides_the_verbatim_block_carrier() -> None:
+    """A turn-2 echo decodes into ordered verbatim per-block messages.
+
+    The echoed turn (server_tool_use, web_search_tool_result, cited text)
+    must round-trip byte-faithfully: every block, extras and provider-issued
+    encrypted payloads included, becomes one whole-message carrier at its
+    position.
+    """
+    blocks = _echoed_web_search_turn()
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "search please"},
+                {"role": "assistant", "content": blocks},
+                {"role": "user", "content": "thanks, just the version"},
+            ],
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+        )
+    )
+    messages = decoded.request.messages
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "assistant",
+        "assistant",
+        "user",
+    ]
+    carried = [
+        message.provider_anthropic_block
+        for message in messages
+        if message.provider_anthropic_block is not None
+    ]
+    assert carried == blocks
+    assert messages[-1].content == "thanks, just the version"
+
+
+def test_cited_text_splits_around_plain_assistant_text_in_order() -> None:
+    """Plain text merges as content while cited text carries verbatim."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Let me check."},
+                        {
+                            "type": "text",
+                            "text": "It is 3.14.7.",
+                            "citations": [{"type": "web_search_result_location"}],
+                        },
+                        {"type": "text", "text": "Anything else?"},
+                    ],
+                },
+                {"role": "user", "content": "no"},
+            ]
+        )
+    )
+    assistant = decoded.request.messages[1:4]
+    assert assistant[0].content == "Let me check."
+    assert assistant[1].provider_anthropic_block == {
+        "type": "text",
+        "text": "It is 3.14.7.",
+        "citations": [{"type": "web_search_result_location"}],
+    }
+    assert assistant[2].content == "Anything else?"
+
+
+def test_uncited_citation_shapes_stay_on_the_plain_text_path() -> None:
+    """The SDK accumulator's null and empty citations decode as plain text."""
+    for citations in (None, []):
+        decoded = decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok", "citations": citations}],
+                    },
+                    {"role": "user", "content": "next"},
+                ]
+            )
+        )
+        assistant = decoded.request.messages[1]
+        assert assistant.content == "ok"
+        assert assistant.provider_anthropic_block is None
+
+
+def test_server_tool_blocks_and_citations_are_assistant_only() -> None:
+    """Server-tool output shapes in a user turn are rejected with the field."""
+    for content in (
+        [{"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}],
+        [{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []}],
+        [{"type": "text", "text": "hi", "citations": [{"type": "char_location"}]}],
+    ):
+        with pytest.raises(OpenAIProtocolError) as error:
+            decode_messages(_body(messages=[{"role": "user", "content": content}]))
+        assert error.value.status_code == 400
+        assert "assistant" in error.value.detail.message
+
+
+def test_decode_carries_block_level_cache_markers_like_a_live_claude_code_turn() -> None:
+    """P0 (captured live 2026-09-01): Claude Code marks two of its three
+    system blocks and the last text block of the last user turn; agent loops
+    also mark tool_result breakpoints. Flattening dropped every marker, so
+    nothing through the gateway was ever cacheable (measured cache_read=0
+    across whole sessions, ~10x input billing)."""
+    decoded = decode_messages(
+        _body(
+            system=[
+                {"type": "text", "text": "You are Claude Code."},
+                {"type": "text", "text": "Short block.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Long env block.", "cache_control": {"type": "ephemeral"}},
+            ],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "context"},
+                        {
+                            "type": "text",
+                            "text": "do the thing",
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call-1", "name": "Bash", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": "ok",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
+        )
+    )
+    system = decoded.request.messages[0]
+    assert system.role == "system"
+    assert system.content == "You are Claude Code.\n\nShort block.\n\nLong env block."
+    assert system.provider_text_blocks == (
+        {"type": "text", "text": "You are Claude Code."},
+        {"type": "text", "text": "Short block.", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "Long env block.", "cache_control": {"type": "ephemeral"}},
+    )
+    user = decoded.request.messages[1]
+    assert user.content == "contextdo the thing"
+    assert user.provider_text_blocks == (
+        {"type": "text", "text": "context"},
+        {"type": "text", "text": "do the thing", "cache_control": {"type": "ephemeral"}},
+    )
+    tool = decoded.request.messages[3]
+    assert tool.role == "tool"
+    assert tool.cache_control == {"type": "ephemeral"}
+
+    # A markerless request carries nothing: payloads stay byte-identical.
+    plain = decode_messages(_body(system=[{"type": "text", "text": "You are terse."}])).request
+    assert plain.messages[0].provider_text_blocks == ()
+    assert plain.messages[1].provider_text_blocks == ()
+
+
+def test_video_block_is_rejected_with_a_surface_hint() -> None:
+    """The Messages wire defines no video block, so one is refused loudly."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what happens"},
+                            {
+                                "type": "video",
+                                "source": {"type": "url", "url": "https://example.com/a.mp4"},
+                            },
+                        ],
+                    }
+                ]
+            )
+        )
+    assert "video blocks are not supported" in excinfo.value.detail.message
+
+
+def test_audio_block_is_rejected_with_a_surface_hint() -> None:
+    """The Messages wire defines no audio block, so one is refused by name, not dropped."""
+    for body in (
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is said"},
+                        {"type": "audio", "source": {"type": "base64", "data": "UklGRg=="}},
+                    ],
+                }
+            ]
+        ),
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": [
+                                {"type": "audio", "source": {"type": "base64", "data": "UklGRg=="}}
+                            ],
+                        }
+                    ],
+                },
+            ]
+        ),
+    ):
+        with pytest.raises(OpenAIProtocolError) as excinfo:
+            decode_messages(body)
+        assert "audio blocks are not supported" in excinfo.value.detail.message
+        assert "input_audio" not in excinfo.value.detail.message
+        assert "Chat Completions" in excinfo.value.detail.message
+
+
+def test_a_screenshot_history_beyond_twenty_images_still_decodes() -> None:
+    """A long agent session's image history clears validation and route shaping.
+
+    Screenshots are baked into the transcript, so a per-request image ceiling
+    the history can grow into wedges the session: the live incident hit
+    "a request carries at most 20 images" once its screenshot history passed
+    20, and every replay failed forever. The Anthropic API itself accepts 100
+    images per request, so 21 must decode; beyond the API ceiling the named
+    rejection stays (the provider would refuse anyway, less clearly).
+    """
+    image_block: dict[str, object] = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64},
+    }
+    decoded = decode_messages(_body(messages=[{"role": "user", "content": [image_block] * 21}]))
+    assert len(decoded.request.images) == 21
+
+    with pytest.raises(OpenAIProtocolError, match="at most 100 images"):
+        decode_messages(_body(messages=[{"role": "user", "content": [image_block] * 101}]))
+
+
+def _openai_reasoning_profile() -> GatewayWireProfile:
+    """Return one OpenAI Responses profile with the standard effort ladder."""
+    return GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://api.openai.com/v1/responses",
+        model_id="gpt-5.6-sol",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+        supported_reasoning_efforts=("none", "low", "medium", "high"),
+    )
+
+
+def test_a_bare_claude_code_thinking_request_serves_on_an_openai_route() -> None:
+    """The budgetless Messages thinking channel translates end to end, disclosed.
+
+    Driven through the real /v1/messages decode surface and the admission
+    sequence: route shaping still rejects the config by name, the coercion
+    layer translates it, and the coerced request reaches the OpenAI payload
+    as a reasoning effort.
+    """
+    import pytest as _pytest
+
+    from exp.runtime.models.providers.capability_policy import coerce_generation_parameters
+    from exp.runtime.models.providers.errors import ProviderParameterError
+    from exp.runtime.models.providers.streaming_requests import (
+        dialect_stream_payload,
+        route_generation_parameter_requests,
+    )
+
+    decoded = decode_messages(
+        _body(
+            max_tokens=16000,
+            messages=[{"role": "user", "content": "hi"}],
+            thinking={"type": "enabled"},
+        )
+    )
+    profile = _openai_reasoning_profile()
+    with _pytest.raises(ProviderParameterError, match="thinking"):
+        route_generation_parameter_requests((profile,), decoded.request)
+
+    coercion = coerce_generation_parameters((profile,), decoded.request)
+    assert coercion is not None
+    assert coercion.disclosures == ("thinking->reasoning_effort:medium(gateway_default)",)
+    _public, provider = route_generation_parameter_requests((profile,), coercion.request)
+    payload = dialect_stream_payload(profile, provider)
+    assert payload["reasoning"] == {"effort": "medium"}
+    assert "thinking" not in payload
+
+
+def test_a_failed_tool_result_serves_on_an_openai_route() -> None:
+    """The exact live repro (is_error:true on a GPT route) now serves.
+
+    Previously: "The parameter 'messages.content.is_error' is not supported
+    by this model route", which 400-killed a Claude Code session the moment
+    any tool call failed. The flag folds into the result text, disclosed.
+    """
+    from exp.runtime.models.providers.streaming_requests import (
+        dialect_stream_payload,
+        route_generation_parameter_requests,
+    )
+
+    decoded = decode_messages(
+        _body(
+            max_tokens=64,
+            tools=[
+                {
+                    "name": "run",
+                    "description": "run a command",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                }
+            ],
+            messages=[
+                {"role": "user", "content": "run false"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01",
+                            "name": "run",
+                            "input": {"cmd": "false"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_01",
+                            "content": "exit 1",
+                            "is_error": True,
+                        }
+                    ],
+                },
+            ],
+        )
+    )
+    profile = _openai_reasoning_profile()
+    public, provider = route_generation_parameter_requests((profile,), decoded.request)
+
+    assert "messages.content.is_error->content" in public.ignored_parameters
+    payload = dialect_stream_payload(profile, provider)
+    items = [item for item in cast("list[JsonObject]", payload["input"])]
+    outputs = [item for item in items if item.get("type") == "function_call_output"]
+    assert outputs == [
+        {"type": "function_call_output", "call_id": "toolu_01", "output": "[tool error] exit 1"}
+    ]
+
+
+def test_the_claude_code_model_probe_refuses_an_incompatible_provider_floor() -> None:
+    """A one-token probe is refused rather than secretly raised to sixteen."""
+    decoded = decode_messages(_body(max_tokens=1, messages=[{"role": "user", "content": "hi"}]))
+    profile = _openai_reasoning_profile()
+    with pytest.raises(ProviderParameterError) as rejected:
+        route_generation_parameter_requests((profile,), decoded.request)
+    assert rejected.value.param == "max_tokens"
+    assert rejected.value.code == "invalid_parameter"
+    assert decoded.request.maximum_output_tokens == 1
+
+
+def test_decode_names_a_duplicate_tool_use_id_instead_of_crashing() -> None:
+    """A canonical-contract violation in a replayed turn is a named 400.
+
+    Two ``tool_use`` blocks sharing one id in a single assistant turn violate
+    the canonical assistant-message contract during turn translation, after
+    the wire models have already passed. That exception must map to the
+    turn-specific protocol error every other invalid shape gets: before the
+    mapping it escaped decode as an unclassified 500 whose "retry the
+    request" guidance is wrong for caller-shaped input.
+    """
+    with pytest.raises(OpenAIProtocolError, match="messages.1.*unique") as rejected:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "t"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "dup", "name": "a", "input": {}},
+                            {"type": "tool_use", "id": "dup", "name": "a", "input": {}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "dup", "content": "x"},
+                            {"type": "tool_result", "tool_use_id": "dup", "content": "y"},
+                        ],
+                    },
+                ],
+                tools=[{"name": "a", "description": "d", "input_schema": {"type": "object"}}],
+            )
+        )
+    assert rejected.value.status_code == 400
+    assert rejected.value.detail.param == "messages.1"
+
+
+def test_forced_tool_choice_decodes_to_the_canonical_forced_forms() -> None:
+    """``any`` and a named ``tool`` reach the canonical forced forms admission
+    narrows and coerces on; ``auto`` and ``none`` stay open selectors."""
+    tools = [{"name": "lookup", "input_schema": {"type": "object"}}]
+    forced_any = decode_messages(_body(tool_choice={"type": "any"}, tools=tools))
+    assert forced_any.request.tool_choice == "required"
+    forced_named = decode_messages(
+        _body(tool_choice={"type": "tool", "name": "lookup"}, tools=tools)
+    )
+    assert forced_named.request.tool_choice == GatewayNamedToolChoice(name="lookup")
+    assert decode_messages(
+        _body(tool_choice={"type": "auto"}, tools=tools)
+    ).request.tool_choice == ("auto")
+
+
+def test_openrouter_reasoning_effort_rides_the_canonical_effort_channel() -> None:
+    """OpenRouter's ``reasoning: {effort}`` is a second effort channel beside thinking.
+
+    Agents built against OpenRouter's Anthropic-compatible Messages endpoint
+    send it verbatim; the gateway maps it onto ``reasoning_effort`` so every
+    rung (native Anthropic through ``output_config`` or a budget, effort
+    ladders elsewhere) sees the same canonical tier.
+    """
+    decoded = decode_messages(_body(reasoning={"effort": "low"}))
+    assert decoded.request.reasoning_effort == "low"
+    assert decoded.request.provider_thinking_config is None
+    assert decoded.request.provider_output_config is None
+    assert decoded.request.reasoning_effort_parameter == "reasoning.effort"
+    assert decoded.request.ignored_parameters == ()
+    # The Anthropic channel alone keeps the surface default for rejections.
+    native = decode_messages(_body(output_config={"effort": "low"}))
+    assert native.request.reasoning_effort_parameter is None
+    off = decode_messages(_body(reasoning={"effort": "none"})).request
+    assert off.reasoning_effort is None
+    assert off.provider_thinking_config == {"type": "disabled"}
+    assert decode_messages(_body(reasoning={"effort": "max"})).request.reasoning_effort == "max"
+
+
+def test_openrouter_reasoning_enabled_and_budget_forms_translate() -> None:
+    """A bare enable names default depth; a numeric budget remains an exact bound."""
+    enabled = decode_messages(_body(reasoning={"enabled": True}))
+    assert enabled.request.reasoning_effort == "medium"
+    disabled = decode_messages(_body(reasoning={"enabled": False}))
+    assert disabled.request.reasoning_effort is None
+    assert disabled.request.provider_thinking_config == {"type": "disabled"}
+    # A budget stays numerical for budget-capable rungs. Other wires refuse
+    # rather than approximating this hard bound with an advisory effort.
+    budget = decode_messages(_body(max_tokens=64000, reasoning={"max_tokens": 32000}))
+    assert budget.request.provider_thinking_config == {"type": "enabled", "budget_tokens": 32000}
+    assert budget.request.reasoning_effort is None
+    # exclude only hides reasoning from the reply, which this gateway does not
+    # render for non-Anthropic rungs anyway; it is dropped with disclosure.
+    excluded = decode_messages(_body(reasoning={"effort": "high", "exclude": True}))
+    assert excluded.request.reasoning_effort == "high"
+    assert "reasoning.exclude" in excluded.request.ignored_parameters
+
+
+def test_openrouter_reasoning_rejects_conflicting_and_unknown_shapes() -> None:
+    """Closed validation: effort and max_tokens are exclusive; unknown keys 400."""
+    with pytest.raises(OpenAIProtocolError) as both:
+        decode_messages(_body(reasoning={"effort": "high", "max_tokens": 2000}))
+    assert both.value.detail.param == "reasoning"
+    with pytest.raises(OpenAIProtocolError) as unknown:
+        decode_messages(_body(reasoning={"effort": "high", "depth": 3}))
+    assert unknown.value.status_code == 400
+    with pytest.raises(OpenAIProtocolError) as bad_effort:
+        decode_messages(_body(reasoning={"effort": "hyperdrive"}))
+    assert bad_effort.value.detail.param == "reasoning.effort"
+    with pytest.raises(OpenAIProtocolError) as oversized:
+        decode_messages(_body(max_tokens=2000, reasoning={"max_tokens": 2000}))
+    assert oversized.value.detail.param == "reasoning.max_tokens"
+    with pytest.raises(OpenAIProtocolError) as tiny:
+        decode_messages(_body(max_tokens=2000, reasoning={"max_tokens": 512}))
+    assert tiny.value.detail.param == "reasoning.max_tokens"
+
+
+def test_openrouter_reasoning_wins_over_thinking_and_output_config_with_disclosure() -> None:
+    """Two reasoning channels on one request: the explicit effort wins, disclosed.
+
+    ``thinking`` is dropped (Anthropic rungs still reason at the effort through
+    the shared channel) and an ``output_config.effort`` that disagrees is
+    dropped from the forwarded object so it and the routing decision cannot
+    diverge; the payload seam re-seeds the effort from the shared channel.
+    """
+    decoded = decode_messages(
+        _body(
+            max_tokens=4096,
+            reasoning={"effort": "high"},
+            thinking={"type": "enabled"},
+            output_config={"effort": "low", "format": {"type": "text"}},
+        )
+    )
+    assert decoded.request.reasoning_effort == "high"
+    assert decoded.request.provider_thinking_config is None
+    assert decoded.request.provider_output_config == {"format": {"type": "text"}}
+    assert decoded.request.reasoning_effort_parameter == "reasoning.effort"
+    assert "thinking->dropped(superseded_by_reasoning)" in decoded.request.ignored_parameters
+    assert (
+        "output_config.effort->dropped(superseded_by_reasoning)"
+        in decoded.request.ignored_parameters
+    )
+    # An agreeing output_config.effort needs no disclosure.
+    agreeing = decode_messages(
+        _body(reasoning={"effort": "high"}, output_config={"effort": "high"})
+    )
+    assert agreeing.request.ignored_parameters == ()
+
+
+_CARRIER = "x-experiential-hunyuan-reasoning-v1:ZGVwbG95bWVudC0x:c2VhbGVkLWVudmVsb3Bl"
+"""One syntactically complete Hunyuan carrier (deployment hint + envelope)."""
+
+
+def test_unsigned_thinking_block_decodes_as_gateway_plaintext_reasoning() -> None:
+    """A thinking block with no signature is the gateway's own exposed reasoning.
+
+    Anthropic signs every thinking block it issues; the Messages surface
+    renders a Tencent/DeepSeek rung's plaintext reasoning as an UNSIGNED
+    thinking block, so on replay it decodes exactly like Chat's plaintext
+    ``reasoning_content``: caller-owned history that exposing rungs forward
+    and every other rung drops with disclosure. It is not an Anthropic block,
+    so no verbatim block order is retained for the Anthropic wire.
+    """
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "the user wants ls", "signature": ""},
+                        {"type": "text", "text": '{"command": "ls"}'},
+                    ],
+                },
+                {"role": "user", "content": "a.txt"},
+            ]
+        )
+    )
+    assistant = decoded.request.messages[1]
+    assert assistant.content == '{"command": "ls"}'
+    assert [block.kind for block in assistant.provider_reasoning] == ["exposed_reasoning_content"]
+    exposed = assistant.provider_reasoning[0]
+    assert isinstance(exposed, ExposedReasoningContentBlock)
+    assert exposed.content == "the user wants ls"
+    assert assistant.provider_anthropic_blocks is None
+
+    # An unsigned block with no text carries nothing worth replaying.
+    empty = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "", "signature": ""},
+                        {"type": "text", "text": "ok"},
+                    ],
+                },
+                {"role": "user", "content": "again"},
+            ]
+        )
+    )
+    assert empty.request.messages[1].provider_reasoning == ()
+
+
+def test_redacted_thinking_carrying_a_gateway_carrier_decodes_sealed() -> None:
+    """A redacted_thinking block whose data is a gateway carrier is the sealed carrier.
+
+    The Messages tool turn returns its reasoning as one trailing
+    redacted_thinking block holding the sealed carrier (Anthropic's opaque
+    replay-verbatim shape). On replay it decodes to the same sealed block the
+    Chat wire's carrier decodes to, and the unsigned display block that
+    streamed beside it is dropped: the carrier holds that text authenticated.
+    """
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "think privately", "signature": ""},
+                        {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
+                        {"type": "redacted_thinking", "data": _CARRIER},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "call-1", "content": "done"}
+                    ],
+                },
+            ]
+        )
+    )
+    assistant = decoded.request.messages[1]
+    assert assistant.tool_calls[0].call_id == "call-1"
+    assert [block.kind for block in assistant.provider_reasoning] == ["sealed_reasoning_content"]
+    sealed = assistant.provider_reasoning[0]
+    assert isinstance(sealed, SealedReasoningContentBlock)
+    assert sealed.carrier == _CARRIER
+    assert sealed.deployment_hint == "deployment-1"
+    assert assistant.provider_anthropic_blocks is None
+
+    # A carrier-prefixed payload that is not a complete carrier names its block.
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "go"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
+                            {
+                                "type": "redacted_thinking",
+                                "data": "x-experiential-hunyuan-reasoning-v1:broken",
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "call-1", "content": "done"}
+                        ],
+                    },
+                ]
+            )
+        )
+    assert rejected.value.detail.param == "messages.1.content.1"
+
+
+def test_anthropic_signed_thinking_still_decodes_verbatim_beside_gateway_blocks() -> None:
+    """A provider-signed block keeps its Anthropic contract; only unsigned ones are ours."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "private", "signature": "sig=="},
+                        {"type": "redacted_thinking", "data": "opaque=="},
+                        {"type": "text", "text": "done"},
+                    ],
+                },
+                {"role": "user", "content": "again"},
+            ]
+        )
+    )
+    assistant = decoded.request.messages[1]
+    assert [block.kind for block in assistant.provider_reasoning] == [
+        "thinking",
+        "redacted_thinking",
+    ]
+    assert assistant.provider_anthropic_blocks is not None
+
+
+def test_claude_code_beta_header_set_decodes_with_per_token_disclosures() -> None:
+    """Claude Code's live beta header set never rejects the request.
+
+    The allowlisted tokens forward; every other token (the product umbrella,
+    the effort beta, fine-grained tool streaming) drops with its own
+    disclosure and the rest of the request decodes untouched.
+    """
+    header = (
+        "claude-code-20250219,interleaved-thinking-2025-05-14,"
+        "fine-grained-tool-streaming-2025-05-14,effort-2025-11-24,"
+        "context-management-2025-06-27"
+    )
+    decoded = decode_messages(
+        _body(
+            thinking={"type": "enabled"},
+            output_config={"effort": "high"},
+            tools=[{"name": "Bash", "input_schema": {"type": "object", "properties": {}}}],
+        ),
+        anthropic_beta=header,
+    )
+    assert decoded.request.provider_beta_tokens == (
+        "interleaved-thinking-2025-05-14",
+        "context-management-2025-06-27",
+    )
+    assert decoded.request.ignored_parameters == (
+        "anthropic-beta.claude-code-20250219",
+        "anthropic-beta.fine-grained-tool-streaming-2025-05-14",
+        "anthropic-beta.effort-2025-11-24",
+    )
+    assert decoded.request.reasoning_effort == "high"
+    assert decoded.request.provider_thinking_config == {"type": "enabled"}
+    assert [tool.name for tool in decoded.request.tools] == ["Bash"]
+
+
+def test_a_thinking_budget_at_or_above_max_tokens_is_refused_at_the_boundary() -> None:
+    """Anthropic's own rule, applied before any reservation or provider call.
+
+    A budget at or above ``max_tokens`` can only end as thinking cut off at the
+    ceiling with no text (Anthropic answers "max_tokens must be greater than
+    thinking budget_tokens"), so the gateway refuses it on ``thinking.budget_tokens``
+    like the sibling ``reasoning.max_tokens`` channel. A budget below Anthropic's
+    1024 minimum is NOT refused: an Anthropic rung replaces it with the derived
+    legal budget (disclosed) and an effort rung reads it as a depth hint, so it
+    is accepted and carried verbatim. ``count_tokens`` has no ceiling to check.
+    """
+    from exp.runtime.anthropic_protocol.requests import decode_messages_count_tokens
+
+    with pytest.raises(OpenAIProtocolError) as equal:
+        decode_messages(_body(max_tokens=4096, thinking={"type": "enabled", "budget_tokens": 4096}))
+    assert equal.value.status_code == 400
+    assert equal.value.detail.param == "thinking.budget_tokens"
+    assert "max_tokens" in equal.value.detail.message
+    with pytest.raises(OpenAIProtocolError) as above:
+        decode_messages(_body(max_tokens=256, thinking={"type": "enabled", "budget_tokens": 4096}))
+    assert above.value.detail.param == "thinking.budget_tokens"
+
+    small = decode_messages(
+        _body(max_tokens=4096, thinking={"type": "enabled", "budget_tokens": 100})
+    )
+    assert small.request.provider_thinking_config == {"type": "enabled", "budget_tokens": 100}
+
+    counted = decode_messages_count_tokens(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+        }
+    )
+    assert counted.request.provider_thinking_config == {"type": "enabled", "budget_tokens": 4096}
+
+
+@pytest.mark.parametrize("reasoning", ({"effort": "high"}, {"enabled": False}))
+def test_a_numeric_thinking_budget_cannot_be_superseded(reasoning: JsonObject) -> None:
+    """Conflicting channels are refused instead of erasing a numerical bound."""
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_messages(
+            _body(
+                max_tokens=2048,
+                thinking={"type": "enabled", "budget_tokens": 4096},
+                reasoning=reasoning,
+            )
+        )
+    assert rejected.value.status_code == 400
+    assert rejected.value.detail.param == "thinking.budget_tokens"
+
+
+def test_provider_zdr_demand_decodes_on_the_messages_surface() -> None:
+    """The cross-surface ``provider`` object works through Anthropic ``extra_body`` too."""
+    decoded = decode_messages(_body(provider={"zdr": True, "order": ["Amazon Bedrock"]}))
+    assert decoded.request.zdr_requested is True
+    assert decoded.request.provider_preferences == {"zdr": True, "order": ["Amazon Bedrock"]}
+    plain = decode_messages(_body())
+    assert plain.request.zdr_requested is False
+    assert plain.request.provider_preferences is None
+
+
+def test_web_search_server_tool_also_normalizes_into_a_gateway_search() -> None:
+    """The verbatim carrier stays for Anthropic rungs; other routes get the gateway search."""
+    decoded = decode_messages(
+        _body(
+            tools=[
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 3,
+                    "blocked_domains": ["spam.example"],
+                    "user_location": {"type": "approximate", "city": "Bern"},
+                }
+            ]
+        )
+    )
+    search = decoded.request.web_search
+    assert search is not None
+    assert search.declared_as == "messages_server_tool"
+    assert search.max_uses == 3
+    assert search.blocked_domains == ("spam.example",)
+    assert search.user_location == {"type": "approximate", "city": "Bern"}
+    assert decoded.request.provider_server_tools[0]["type"] == "web_search_20250305"
+    plain = decode_messages(_body())
+    assert plain.request.web_search is None
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_messages(
+            _body(
+                tools=[
+                    {
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "allowed_domains": ["a.com"],
+                        "blocked_domains": ["b.com"],
+                    }
+                ]
+            )
+        )
+    assert error.value.detail.param == "tools.0"
+
+
+def test_tool_search_server_tools_are_accepted_and_normalized() -> None:
+    """Anthropic's tool-search declarations are served (natively or by the gateway)."""
+    decoded = decode_messages(
+        _body(
+            tools=[
+                {"name": "deferred", "input_schema": {"type": "object"}, "defer_loading": True},
+                {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+            ]
+        )
+    )
+    search = decoded.request.tool_search
+    assert search is not None
+    assert search.declared_as == "messages_server_tool"
+    assert search.mode == "regex"
+    assert search.tool_type == "tool_search_tool_regex_20251119"
+    assert search.tool_name == "tool_search_tool_regex"
+    assert decoded.request.tools[0].defer_loading is True
+    assert decoded.request.provider_server_tools[0]["type"] == "tool_search_tool_regex_20251119"
+    bm25 = decode_messages(
+        _body(tools=[{"type": "tool_search_tool_bm25", "name": "tool_search_tool_bm25"}])
+    )
+    assert bm25.request.tool_search is not None and bm25.request.tool_search.mode == "bm25"
+
+
+def test_tool_search_result_blocks_in_history_are_accepted() -> None:
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "find a weather tool"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_1",
+                            "name": "tool_search_tool_bm25",
+                            "input": {"query": "weather"},
+                        },
+                        {
+                            "type": "tool_search_tool_result",
+                            "tool_use_id": "srvtoolu_1",
+                            "content": {
+                                "type": "tool_search_tool_search_result",
+                                "tool_references": [
+                                    {"type": "tool_reference", "tool_name": "get_weather"}
+                                ],
+                            },
+                        },
+                        {"type": "text", "text": "Found it."},
+                    ],
+                },
+                {"role": "user", "content": "Use it."},
+            ]
+        )
+    )
+    assert len(decoded.request.messages) >= 3

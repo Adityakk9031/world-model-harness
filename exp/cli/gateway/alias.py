@@ -17,8 +17,9 @@ from exp.common.models import (
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
-    ModelCatalog,
+    read_model_catalog_document,
 )
+from exp.common.models.known_models import known_model_metadata
 from exp.optimize.router.activation import load_project_router
 from exp.runtime.gateway.catalog_authority import (
     authored_snapshot_path,
@@ -41,6 +42,11 @@ _EXACT_MODEL_OPTION = typer.Option(None, "--exact-model")
 _PROJECT_OPTION = typer.Option(None, "--project")
 _POLICY_OPTION = typer.Option(None, "--policy")
 _REVISION_OPTION = typer.Option(None, "--revision")
+_PRICE_HELP = "Integer nano-USD per million tokens ($1.25 per million is 1250000000)."
+_INPUT_PRICE_OPTION = typer.Option(None, "--input-price", min=0, help=_PRICE_HELP)
+_CACHED_INPUT_PRICE_OPTION = typer.Option(None, "--cached-input-price", min=0, help=_PRICE_HELP)
+_OUTPUT_PRICE_OPTION = typer.Option(None, "--output-price", min=0, help=_PRICE_HELP)
+_REASONING_PRICE_OPTION = typer.Option(None, "--reasoning-price", min=0, help=_PRICE_HELP)
 _PRICING_SOURCE_OPTION = typer.Option(None, "--pricing-source")
 _MAXIMUM_OUTPUT_OPTION = typer.Option(None, "--maximum-output-tokens", min=1)
 _REFUSAL_FAILOVER_OPTION = typer.Option(False, "--refusal-failover")
@@ -49,6 +55,245 @@ _STREAMING_TOOL_ARGUMENTS_OPTION = typer.Option(
     None,
     "--supports-streaming-tool-arguments/--no-supports-streaming-tool-arguments",
 )
+_IMAGE_INPUT_OPTION = typer.Option(False, "--supports-image-input")
+_IMAGE_URL_INPUT_OPTION = typer.Option(
+    None,
+    "--supports-image-url-input/--no-supports-image-url-input",
+)
+_PDF_INPUT_OPTION = typer.Option(False, "--supports-pdf-input")
+_PDF_URL_INPUT_OPTION = typer.Option(
+    None,
+    "--supports-pdf-url-input/--no-supports-pdf-url-input",
+)
+
+_VIDEO_INPUT_OPTION = typer.Option(False, "--supports-video-input")
+_MEDIA_HANDLE_INPUT_OPTION = typer.Option(False, "--supports-media-handle-input")
+_VIDEO_URL_INPUT_OPTION = typer.Option(
+    None,
+    "--supports-video-url-input/--no-supports-video-url-input",
+)
+_AUDIO_INPUT_OPTION = typer.Option(False, "--supports-audio-input")
+
+IMAGE_URL_PROVIDERS = frozenset({"anthropic", "azure", "openai", "openrouter"})
+"""Providers whose wire fetches a caller image URL on the gateway's behalf.
+
+Every other adapter, notably Gemini, Vertex, and Bedrock, accepts inline bytes
+only, so a route on one of those providers must not claim URL input."""
+
+VIDEO_PROVIDERS = frozenset({"bedrock", "gemini", "openai-compatible", "openrouter", "vertex"})
+"""Providers whose wire defines a caller video carrier.
+
+Gemini and Vertex take inline bytes or a fetched URI, Bedrock Converse takes
+inline bytes, and the OpenAI-compatible Chat wire (OpenRouter, Fireworks)
+takes a ``video_url`` part. OpenAI, Azure OpenAI, and Anthropic define no
+video input, so a route on those providers must not claim it."""
+
+VIDEO_URL_PROVIDERS = frozenset({"gemini", "openai-compatible", "openrouter", "vertex"})
+"""Video providers whose wire fetches a caller video URL on the gateway's behalf."""
+
+MEDIA_HANDLE_PROVIDERS = frozenset({"anthropic", "bedrock", "gemini", "openai", "vertex"})
+"""Providers whose inference wire resolves a handle to media uploaded to that provider.
+
+OpenAI (``file_id`` on Chat ``file`` and Responses ``input_image`` /
+``input_file``), Anthropic (``file`` source), Gemini (Files API URI), Vertex
+(``gs://`` object), and Bedrock (``s3Location``). Azure OpenAI file ids live in
+a separate namespace that a bare ``file_id`` cannot name, and the
+OpenAI-compatible Chat wire (OpenRouter, Fireworks) defines no uploaded-media
+reference, so a route on those providers must not claim handle input."""
+
+AUDIO_PROVIDERS = frozenset({"azure", "gemini", "openai-compatible", "openrouter", "vertex"})
+"""Providers whose wire defines a caller audio carrier some model serves.
+
+The Chat Completions ``input_audio`` part (Azure OpenAI deployments,
+OpenRouter, and an OpenAI-compatible connection such as api.openai.com's own
+Chat endpoint) and the Gemini ``inline_data`` part carry audio. The ``openai``
+adapter speaks the Responses wire, which refuses audio input on every model;
+Anthropic defines no audio block; and no Bedrock Converse model accepts the
+``audio`` block its schema lists. A route on those providers must not claim
+audio. Audio has no remote URL carrier, so there is no URL declaration.
+An Azure connection serving a known Anthropic model resolves to the
+Anthropic Messages wire and is refused for the same reason."""
+
+PDF_URL_PROVIDERS = frozenset({"anthropic", "openai"})
+"""Providers whose wire fetches a caller PDF URL on the gateway's behalf.
+
+Only the OpenAI Responses (``file_url``) and Anthropic Messages (``url``
+document source) wires fetch a remote document. Chat Completions ``file``
+parts (Azure OpenAI deployments, OpenRouter, and every other OpenAI-compatible
+adapter), Gemini, Vertex, and Bedrock accept inline bytes only. An Azure
+connection serving a known Anthropic model is the exception: it resolves to
+the native Anthropic Messages wire, so ``_fetches_pdf_urls`` admits it."""
+
+
+def _fetches_pdf_urls(provider: str, provider_model: str) -> bool:
+    """Return whether this deployment resolves to a wire that fetches PDF URLs."""
+    if provider in PDF_URL_PROVIDERS:
+        return True
+    return provider == "azure" and known_model_metadata("anthropic", provider_model) is not None
+
+
+def _declared_image_url_input(
+    *,
+    provider: str,
+    supports_image_input: bool,
+    supports_image_url_input: bool | None,
+) -> bool:
+    """Resolve the route's remote image URL declaration.
+
+    Args:
+        provider: Provider adapter serving the deployment.
+        supports_image_input: Whether the route carries image content at all.
+        supports_image_url_input: Explicit operator declaration, if any.
+
+    Returns:
+        Whether the route may forward a caller-supplied image URL.
+
+    Raises:
+        ValueError: URL input is claimed without image input, or on a provider
+            whose wire cannot fetch a caller URL.
+    """
+    if supports_image_url_input is None:
+        return supports_image_input and provider in IMAGE_URL_PROVIDERS
+    if not supports_image_url_input:
+        return False
+    if not supports_image_input:
+        raise ValueError("--supports-image-url-input requires --supports-image-input")
+    if provider not in IMAGE_URL_PROVIDERS:
+        raise ValueError(f"provider {provider!r} accepts inline image bytes only")
+    return True
+
+
+def _declared_video_input(
+    *,
+    provider: str,
+    supports_video_input: bool,
+    supports_video_url_input: bool | None,
+) -> tuple[bool, bool]:
+    """Resolve the route's video and remote video URL declarations.
+
+    Args:
+        provider: Provider adapter serving the deployment.
+        supports_video_input: Whether the operator declares video content.
+        supports_video_url_input: Explicit operator URL declaration, if any.
+
+    Returns:
+        The ``(supports_video_input, supports_video_url_input)`` pair.
+
+    Raises:
+        ValueError: Video is claimed on a provider whose wire has no video
+            carrier, URL input is claimed without video input, or on a
+            provider whose wire cannot fetch a caller URL.
+    """
+    if not supports_video_input:
+        if supports_video_url_input:
+            raise ValueError("--supports-video-url-input requires --supports-video-input")
+        return False, False
+    if provider not in VIDEO_PROVIDERS:
+        raise ValueError(f"provider {provider!r} has no video input wire")
+    if supports_video_url_input is None:
+        return True, provider in VIDEO_URL_PROVIDERS
+    if supports_video_url_input and provider not in VIDEO_URL_PROVIDERS:
+        raise ValueError(f"provider {provider!r} accepts inline video bytes only")
+    return True, supports_video_url_input
+
+
+def _declared_media_handle_input(
+    *,
+    provider: str,
+    supports_media_handle_input: bool,
+    supports_image_input: bool,
+    supports_video_input: bool,
+    supports_pdf_input: bool,
+) -> bool:
+    """Resolve the route's uploaded-media handle declaration.
+
+    Args:
+        provider: Provider adapter serving the deployment.
+        supports_media_handle_input: Explicit operator declaration.
+        supports_image_input: Whether the route carries image content.
+        supports_video_input: Whether the route carries video content.
+        supports_pdf_input: Whether the route carries PDF documents.
+
+    Returns:
+        Whether the route may forward a caller's provider media handle.
+
+    Raises:
+        ValueError: Handle input is claimed without any media input, or on a
+            provider whose wire resolves no uploaded-media reference.
+    """
+    if not supports_media_handle_input:
+        return False
+    if not (supports_image_input or supports_video_input or supports_pdf_input):
+        raise ValueError(
+            "--supports-media-handle-input requires --supports-image-input, "
+            "--supports-video-input, or --supports-pdf-input"
+        )
+    if provider not in MEDIA_HANDLE_PROVIDERS:
+        raise ValueError(f"provider {provider!r} resolves no uploaded-media handle")
+    return True
+
+
+def _declared_audio_input(
+    *,
+    provider: str,
+    provider_model: str,
+    supports_audio_input: bool,
+) -> bool:
+    """Resolve the route's audio declaration against its wire.
+
+    Args:
+        provider: Provider adapter serving the deployment.
+        provider_model: Provider-side model name of the deployment.
+        supports_audio_input: Whether the operator declares audio content.
+
+    Returns:
+        Whether the route may carry caller audio.
+
+    Raises:
+        ValueError: Audio is claimed on a provider whose wire has no audio
+            carrier any model serves.
+    """
+    if not supports_audio_input:
+        return False
+    if provider not in AUDIO_PROVIDERS:
+        raise ValueError(f"provider {provider!r} has no audio input wire")
+    if provider == "azure" and known_model_metadata("anthropic", provider_model) is not None:
+        raise ValueError("an Azure Anthropic deployment has no audio input wire")
+    return True
+
+
+def _declared_pdf_url_input(
+    *,
+    provider: str,
+    provider_model: str,
+    supports_pdf_input: bool,
+    supports_pdf_url_input: bool | None,
+) -> bool:
+    """Resolve the route's remote PDF URL declaration.
+
+    Args:
+        provider: Provider adapter serving the deployment.
+        provider_model: Provider-side model identifier of the deployment.
+        supports_pdf_input: Whether the route carries PDF documents at all.
+        supports_pdf_url_input: Explicit operator declaration, if any.
+
+    Returns:
+        Whether the route may forward a caller-supplied document URL.
+
+    Raises:
+        ValueError: URL input is claimed without PDF input, or on a provider
+            whose wire cannot fetch a caller document URL.
+    """
+    fetches_urls = _fetches_pdf_urls(provider, provider_model)
+    if supports_pdf_url_input is None:
+        return supports_pdf_input and fetches_urls
+    if not supports_pdf_url_input:
+        return False
+    if not supports_pdf_input:
+        raise ValueError("--supports-pdf-url-input requires --supports-pdf-input")
+    if not fetches_urls:
+        raise ValueError(f"provider {provider!r} accepts inline PDF bytes only")
+    return True
 
 
 @alias_app.command("list")
@@ -73,11 +318,19 @@ def alias_create(
     supports_strict_tools: bool = typer.Option(False, "--supports-strict-tools"),
     supports_parallel_tool_calls: bool = typer.Option(False, "--supports-parallel-tool-calls"),
     supports_streaming_tool_arguments: bool | None = _STREAMING_TOOL_ARGUMENTS_OPTION,
+    supports_image_input: bool = _IMAGE_INPUT_OPTION,
+    supports_image_url_input: bool | None = _IMAGE_URL_INPUT_OPTION,
+    supports_video_input: bool = _VIDEO_INPUT_OPTION,
+    supports_video_url_input: bool | None = _VIDEO_URL_INPUT_OPTION,
+    supports_audio_input: bool = _AUDIO_INPUT_OPTION,
+    supports_pdf_input: bool = _PDF_INPUT_OPTION,
+    supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
+    supports_media_handle_input: bool = _MEDIA_HANDLE_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
-    input_price: int | None = typer.Option(None, "--input-price", min=0),
-    cached_input_price: int | None = typer.Option(None, "--cached-input-price", min=0),
-    output_price: int | None = typer.Option(None, "--output-price", min=0),
-    reasoning_price: int | None = typer.Option(None, "--reasoning-price", min=0),
+    input_price: int | None = _INPUT_PRICE_OPTION,
+    cached_input_price: int | None = _CACHED_INPUT_PRICE_OPTION,
+    output_price: int | None = _OUTPUT_PRICE_OPTION,
+    reasoning_price: int | None = _REASONING_PRICE_OPTION,
     pricing_source: str | None = _PRICING_SOURCE_OPTION,
     billing_source: BillingSource | None = _BILLING_SOURCE_OPTION,
     refusal_failover: bool = _REFUSAL_FAILOVER_OPTION,
@@ -102,12 +355,20 @@ def alias_create(
             supports_strict_tools=supports_strict_tools,
             supports_parallel_tool_calls=supports_parallel_tool_calls,
             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
+            supports_image_input=supports_image_input,
+            supports_image_url_input=supports_image_url_input,
+            supports_video_input=supports_video_input,
+            supports_video_url_input=supports_video_url_input,
+            supports_audio_input=supports_audio_input,
+            supports_pdf_input=supports_pdf_input,
+            supports_pdf_url_input=supports_pdf_url_input,
+            supports_media_handle_input=supports_media_handle_input,
             maximum_output_tokens=maximum_output_tokens,
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=input_price,
-                cached_input_micro_usd_per_million_tokens=cached_input_price,
-                output_micro_usd_per_million_tokens=output_price,
-                reasoning_micro_usd_per_million_tokens=reasoning_price,
+                input_nano_usd_per_million_tokens=input_price,
+                cached_input_nano_usd_per_million_tokens=cached_input_price,
+                output_nano_usd_per_million_tokens=output_price,
+                reasoning_nano_usd_per_million_tokens=reasoning_price,
             ),
             pricing_source=pricing_source,
             billing_source=billing_source,
@@ -152,11 +413,19 @@ def alias_update(
     supports_strict_tools: bool = typer.Option(False, "--supports-strict-tools"),
     supports_parallel_tool_calls: bool = typer.Option(False, "--supports-parallel-tool-calls"),
     supports_streaming_tool_arguments: bool | None = _STREAMING_TOOL_ARGUMENTS_OPTION,
+    supports_image_input: bool = _IMAGE_INPUT_OPTION,
+    supports_image_url_input: bool | None = _IMAGE_URL_INPUT_OPTION,
+    supports_video_input: bool = _VIDEO_INPUT_OPTION,
+    supports_video_url_input: bool | None = _VIDEO_URL_INPUT_OPTION,
+    supports_audio_input: bool = _AUDIO_INPUT_OPTION,
+    supports_pdf_input: bool = _PDF_INPUT_OPTION,
+    supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
+    supports_media_handle_input: bool = _MEDIA_HANDLE_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
-    input_price: int | None = typer.Option(None, "--input-price", min=0),
-    cached_input_price: int | None = typer.Option(None, "--cached-input-price", min=0),
-    output_price: int | None = typer.Option(None, "--output-price", min=0),
-    reasoning_price: int | None = typer.Option(None, "--reasoning-price", min=0),
+    input_price: int | None = _INPUT_PRICE_OPTION,
+    cached_input_price: int | None = _CACHED_INPUT_PRICE_OPTION,
+    output_price: int | None = _OUTPUT_PRICE_OPTION,
+    reasoning_price: int | None = _REASONING_PRICE_OPTION,
     pricing_source: str | None = _PRICING_SOURCE_OPTION,
     billing_source: BillingSource | None = _BILLING_SOURCE_OPTION,
     refusal_failover: bool = _REFUSAL_FAILOVER_OPTION,
@@ -181,12 +450,20 @@ def alias_update(
             supports_strict_tools=supports_strict_tools,
             supports_parallel_tool_calls=supports_parallel_tool_calls,
             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
+            supports_image_input=supports_image_input,
+            supports_image_url_input=supports_image_url_input,
+            supports_video_input=supports_video_input,
+            supports_video_url_input=supports_video_url_input,
+            supports_audio_input=supports_audio_input,
+            supports_pdf_input=supports_pdf_input,
+            supports_pdf_url_input=supports_pdf_url_input,
+            supports_media_handle_input=supports_media_handle_input,
             maximum_output_tokens=maximum_output_tokens,
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=input_price,
-                cached_input_micro_usd_per_million_tokens=cached_input_price,
-                output_micro_usd_per_million_tokens=output_price,
-                reasoning_micro_usd_per_million_tokens=reasoning_price,
+                input_nano_usd_per_million_tokens=input_price,
+                cached_input_nano_usd_per_million_tokens=cached_input_price,
+                output_nano_usd_per_million_tokens=output_price,
+                reasoning_nano_usd_per_million_tokens=reasoning_price,
             ),
             pricing_source=pricing_source,
             billing_source=billing_source,
@@ -254,6 +531,14 @@ def _activate(
     supports_strict_tools: bool,
     supports_parallel_tool_calls: bool,
     supports_streaming_tool_arguments: bool | None,
+    supports_image_input: bool,
+    supports_image_url_input: bool | None,
+    supports_video_input: bool,
+    supports_video_url_input: bool | None,
+    supports_audio_input: bool,
+    supports_pdf_input: bool,
+    supports_pdf_url_input: bool | None,
+    supports_media_handle_input: bool,
     maximum_output_tokens: int | None,
     prices: GatewayTokenPrices,
     pricing_source: str | None,
@@ -293,6 +578,11 @@ def _activate(
                 provider,
                 ProviderCapability.TOOL_ARGUMENT_STREAM,
             )
+        declared_video_input, declared_video_url_input = _declared_video_input(
+            provider=provider,
+            supports_video_input=supports_video_input,
+            supports_video_url_input=supports_video_url_input,
+        )
         normalized, snapshot, _catalog_changed = upsert_singleton_deployment(
             root,
             deployment_alias=alias,
@@ -312,6 +602,33 @@ def _activate(
                 supports_strict_tools=supports_strict_tools,
                 supports_parallel_tool_calls=supports_parallel_tool_calls,
                 supports_structured_text=supports_structured_output,
+                supports_image_input=supports_image_input,
+                supports_image_url_input=_declared_image_url_input(
+                    provider=provider,
+                    supports_image_input=supports_image_input,
+                    supports_image_url_input=supports_image_url_input,
+                ),
+                supports_video_input=declared_video_input,
+                supports_video_url_input=declared_video_url_input,
+                supports_audio_input=_declared_audio_input(
+                    provider=provider,
+                    provider_model=provider_model,
+                    supports_audio_input=supports_audio_input,
+                ),
+                supports_pdf_input=supports_pdf_input,
+                supports_pdf_url_input=_declared_pdf_url_input(
+                    provider=provider,
+                    provider_model=provider_model,
+                    supports_pdf_input=supports_pdf_input,
+                    supports_pdf_url_input=supports_pdf_url_input,
+                ),
+                supports_media_handle_input=_declared_media_handle_input(
+                    provider=provider,
+                    supports_media_handle_input=supports_media_handle_input,
+                    supports_image_input=supports_image_input,
+                    supports_video_input=declared_video_input,
+                    supports_pdf_input=supports_pdf_input,
+                ),
             ),
             prices=prices,
             pricing_source=pricing_source,
@@ -319,7 +636,9 @@ def _activate(
             replace=replace,
             serving_connections=serving_connections,
         )
-        authored = ModelCatalog.model_validate_json(authored_snapshot_path(snapshot).read_bytes())
+        authored, _dropped = read_model_catalog_document(
+            authored_snapshot_path(snapshot).read_bytes()
+        )
         catalog_sha256 = normalized.identity_sha256()
         return (
             manager.activate_direct_alias(
